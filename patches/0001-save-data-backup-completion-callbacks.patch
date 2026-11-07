@@ -1,0 +1,330 @@
+diff --git a/src/core/libraries/save_data/save_backup.cpp b/src/core/libraries/save_data/save_backup.cpp
+index 3e0e344..cab8405 100644
+--- a/src/core/libraries/save_data/save_backup.cpp
++++ b/src/core/libraries/save_data/save_backup.cpp
+@@ -7,8 +7,10 @@
+ 
+ #include <magic_enum/magic_enum.hpp>
+ 
++#include "core/libraries/kernel/threads.h"
+ #include "save_backup.h"
+ #include "save_instance.h"
++#include "savedata_error.h"
+ 
+ #include "common/io_file.h"
+ #include "common/logging/formatter.h"
+@@ -23,12 +25,16 @@ constexpr std::string_view backup_dir_old = "sce_backup_old"; // previous backup
+ 
+ namespace fs = std::filesystem;
+ 
++namespace Libraries::SaveData {
++void DispatchBackupEvent(const Backup::BackupRequest& request);
++}
++
+ namespace Libraries::SaveData::Backup {
+ 
+ static void CopyShareReadWrite(const std::filesystem::path& from, const std::filesystem::path& to) {
+     std::error_code ec;
+     if (fs::is_directory(from, ec)) {
+-        fs::create_directories(to, ec);
++        fs::create_directories(to);
+         for (const auto& entry : fs::directory_iterator(from)) {
+             CopyShareReadWrite(entry.path(), to / entry.path().filename());
+         }
+@@ -39,12 +45,16 @@ static void CopyShareReadWrite(const std::filesystem::path& from, const std::fil
+                            Common::FS::FileShareFlag::ShareReadWrite};
+     if (!src.IsOpen()) {
+         LOG_ERROR(Lib_SaveData, "Backup: failed to open source {}", fmt::UTF(from.u8string()));
+-        return;
++        throw fs::filesystem_error("backup source open failed", from,
++                                   std::make_error_code(std::errc::io_error));
+     }
+     const u64 size = src.GetSize();
+     std::vector<u8> buf(size);
+     if (size > 0) {
+-        src.ReadRaw<u8>(buf.data(), size);
++        if (src.ReadRaw<u8>(buf.data(), size) != size) {
++            throw fs::filesystem_error("backup source read failed", from,
++                                       std::make_error_code(std::errc::io_error));
++        }
+     }
+     src.Close();
+ 
+@@ -52,15 +62,20 @@ static void CopyShareReadWrite(const std::filesystem::path& from, const std::fil
+                            Common::FS::FileShareFlag::ShareReadWrite};
+     if (!dst.IsOpen()) {
+         LOG_ERROR(Lib_SaveData, "Backup: failed to open destination {}", fmt::UTF(to.u8string()));
+-        return;
++        throw fs::filesystem_error("backup destination open failed", to,
++                                   std::make_error_code(std::errc::io_error));
+     }
+     if (size > 0) {
+-        dst.WriteRaw<u8>(buf.data(), size);
++        if (dst.WriteRaw<u8>(buf.data(), size) != size) {
++            throw fs::filesystem_error("backup destination write failed", to,
++                                       std::make_error_code(std::errc::io_error));
++        }
+     }
+     dst.Close();
+ }
+ 
+-static std::jthread g_backup_thread;
++// Use an emulated thread so guest callbacks have a valid guest TLS/stack context.
++static Kernel::Thread g_backup_thread;
+ static std::counting_semaphore g_backup_thread_semaphore{0};
+ 
+ static std::mutex g_backup_running_mutex;
+@@ -71,11 +86,13 @@ static std::deque<BackupRequest> g_result_queue;
+ 
+ static std::atomic_int g_backup_progress = 0;
+ static std::atomic g_backup_status = WorkerStatus::NotStarted;
++static std::atomic_bool g_backup_stopping = false;
+ 
+ static void backup(const std::filesystem::path& dir_name) {
+     std::unique_lock lk{g_backup_running_mutex};
+     if (!fs::exists(dir_name)) {
+-        return;
++        throw fs::filesystem_error("backup source directory missing", dir_name,
++                                   std::make_error_code(std::errc::no_such_file_or_directory));
+     }
+ 
+     const auto backup_dir = dir_name / ::backup_dir;
+@@ -116,7 +133,7 @@ static void backup(const std::filesystem::path& dir_name) {
+ 
+ static void BackupThreadBody() {
+     Common::SetCurrentThreadName("shadPS4:SaveData:BackupThread");
+-    while (g_backup_status != WorkerStatus::Stopping) {
++    while (!g_backup_stopping) {
+         g_backup_status = WorkerStatus::Waiting;
+ 
+         bool wait;
+@@ -147,12 +164,13 @@ static void BackupThreadBody() {
+                  fmt::UTF(req.save_path.u8string()));
+         try {
+             backup(req.save_path);
+-        } catch (const std::filesystem::filesystem_error& err) {
++        } catch (const std::exception& err) {
++            req.error_code = static_cast<s32>(Error::INTERNAL);
+             LOG_ERROR(Lib_SaveData, "Failed to backup {}: {}", fmt::UTF(req.save_path.u8string()),
+                       err.what());
+         }
+-        LOG_DEBUG(Lib_SaveData, "Backing up the following directory: {} finished",
+-                  fmt::UTF(req.save_path.u8string()));
++        LOG_INFO(Lib_SaveData, "Backup finished: {}, error={}", fmt::UTF(req.save_path.u8string()),
++                 req.error_code);
+         {
+             std::scoped_lock lk{g_backup_queue_mutex};
+             g_backup_queue.front().done = true;
+@@ -161,12 +179,15 @@ static void BackupThreadBody() {
+             std::scoped_lock lk{g_backup_queue_mutex};
+             g_backup_queue.pop_front();
+             if (req.origin != OrbisSaveDataEventType::__DO_NOT_SAVE) {
+-                g_result_queue.push_back(std::move(req));
++                g_result_queue.push_back(req);
+                 if (g_result_queue.size() > 20) {
+                     g_result_queue.pop_front();
+                 }
+             }
+         }
++        if (req.origin != OrbisSaveDataEventType::__DO_NOT_SAVE) {
++            DispatchBackupEvent(req);
++        }
+         std::this_thread::sleep_for(std::chrono::seconds(5)); // Don't backup too often
+     }
+     g_backup_status = WorkerStatus::NotStarted;
+@@ -176,9 +197,13 @@ void StartThread() {
+     if (g_backup_status != WorkerStatus::NotStarted) {
+         return;
+     }
++    g_backup_thread.Join();
++    while (g_backup_thread_semaphore.try_acquire()) {
++    }
++    g_backup_stopping = false;
+     LOG_DEBUG(Lib_SaveData, "Starting backup thread");
+     g_backup_status = WorkerStatus::Waiting;
+-    g_backup_thread = std::jthread{BackupThreadBody};
++    g_backup_thread.Run([](std::stop_token) { BackupThreadBody(); });
+     static std::once_flag flag;
+     std::call_once(flag, [] {
+         std::at_quick_exit([] {
+@@ -195,19 +220,24 @@ void StopThread() {
+         return;
+     }
+     LOG_DEBUG(Lib_SaveData, "Stopping backup thread");
++    g_backup_stopping = true;
+     g_backup_status = WorkerStatus::Stopping;
+     {
+         std::scoped_lock lk{g_backup_queue_mutex};
+         g_backup_queue.emplace_back(BackupRequest{});
+     }
+     g_backup_thread_semaphore.release();
++    g_backup_thread.Join();
++    std::scoped_lock lk{g_backup_queue_mutex};
++    g_backup_queue.clear();
+ }
+ 
+ bool NewRequest(Libraries::UserService::OrbisUserServiceUserId user_id, std::string_view title_id,
+                 std::string_view dir_name, OrbisSaveDataEventType origin) {
+     auto save_path = SaveInstance::MakeDirSavePath(user_id, title_id, dir_name);
+ 
+-    if (g_backup_status != WorkerStatus::Waiting && g_backup_status != WorkerStatus::Running) {
++    if (g_backup_stopping ||
++        (g_backup_status != WorkerStatus::Waiting && g_backup_status != WorkerStatus::Running)) {
+         LOG_ERROR(Lib_SaveData, "Called backup while status is {}. Backup request to {} ignored",
+                   magic_enum::enum_name(g_backup_status.load()), fmt::UTF(save_path.u8string()));
+         return false;
+diff --git a/src/core/libraries/save_data/save_backup.h b/src/core/libraries/save_data/save_backup.h
+index 2a5e54d..8167760 100644
+--- a/src/core/libraries/save_data/save_backup.h
++++ b/src/core/libraries/save_data/save_backup.h
+@@ -30,6 +30,7 @@ enum class OrbisSaveDataEventType : u32 {
+ 
+ struct BackupRequest {
+     bool done{};
++    s32 error_code{};
+ 
+     Libraries::UserService::OrbisUserServiceUserId user_id{};
+     std::string title_id{};
+diff --git a/src/core/libraries/save_data/savedata.cpp b/src/core/libraries/save_data/savedata.cpp
+index 6e4b732..fd8a625 100644
+--- a/src/core/libraries/save_data/savedata.cpp
++++ b/src/core/libraries/save_data/savedata.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cstring>
++#include <mutex>
+ #include <span>
+ #include <thread>
+ #include <vector>
+@@ -14,6 +15,7 @@
+ #include "common/enum.h"
+ #include "common/logging/log.h"
+ #include "common/path_util.h"
++#include "common/scope_exit.h"
+ #include "common/string_util.h"
+ #include "core/emulator_settings.h"
+ #include "core/file_format/psf.h"
+@@ -310,6 +312,32 @@ struct OrbisSaveDataEvent {
+     std::array<u8, 40> _reserved;
+ };
+ 
++static std::recursive_mutex g_event_callback_mutex;
++static OrbisSaveDataEventCallback g_event_callback{};
++static void* g_event_userdata{};
++static thread_local bool g_in_backup_callback = false;
++
++void DispatchBackupEvent(const Backup::BackupRequest& request) {
++    std::scoped_lock lock{g_event_callback_mutex};
++    if (!g_event_callback) {
++        return;
++    }
++    OrbisSaveDataEvent event{};
++    event.type = request.origin;
++    event.errorCode = request.error_code;
++    event.userId = request.user_id;
++    event.titleId.data.FromString(request.title_id);
++    event.dirName.data.FromString(request.dir_name);
++    LOG_INFO(Lib_SaveData, "Delivering backup event: type={}, error={}, dir={}",
++             static_cast<u32>(event.type), event.errorCode, request.dir_name);
++    const bool was_in_callback = g_in_backup_callback;
++    g_in_backup_callback = true;
++    SCOPE_EXIT {
++        g_in_backup_callback = was_in_callback;
++    };
++    g_event_callback(&event, g_event_userdata);
++}
++
+ static bool g_initialized = false;
+ static std::string g_game_serial;
+ static u32 g_fw_ver;
+@@ -974,7 +1002,7 @@ Error PS4_SYSV_ABI sceSaveDataGetEventResult(const OrbisSaveDataEventParam*,
+     }
+ 
+     event->type = last_event->origin;
+-    event->errorCode = 0;
++    event->errorCode = last_event->error_code;
+     event->userId = last_event->user_id;
+     event->titleId.data.FromString(last_event->title_id);
+     event->dirName.data.FromString(last_event->dir_name);
+@@ -1314,9 +1342,19 @@ int PS4_SYSV_ABI sceSaveDataRebuildDatabase() {
+     return ORBIS_OK;
+ }
+ 
+-int PS4_SYSV_ABI sceSaveDataRegisterEventCallback() {
+-    LOG_ERROR(Lib_SaveData, "(STUBBED) called");
+-    return ORBIS_OK;
++Error PS4_SYSV_ABI sceSaveDataRegisterEventCallback(OrbisSaveDataEventCallback callback,
++                                                    void* userdata) {
++    if (!g_initialized) {
++        return setNotInitializedError();
++    }
++    if (!callback) {
++        return Error::PARAMETER;
++    }
++    std::scoped_lock lock{g_event_callback_mutex};
++    g_event_callback = callback;
++    g_event_userdata = userdata;
++    LOG_INFO(Lib_SaveData, "Registered save event callback");
++    return Error::OK;
+ }
+ 
+ Error PS4_SYSV_ABI sceSaveDataRestoreBackupData(const OrbisSaveDataRestoreBackupData* restore) {
+@@ -1665,6 +1703,10 @@ Error PS4_SYSV_ABI sceSaveDataSyncSaveDataMemory(OrbisSaveDataMemorySync* syncPa
+ 
+ Error PS4_SYSV_ABI sceSaveDataTerminate() {
+     LOG_DEBUG(Lib_SaveData, "called");
++    // Termination joins the backup worker; its callback cannot join its own thread.
++    if (g_in_backup_callback) {
++        return Error::BUSY;
++    }
+     if (!g_initialized) {
+         return setNotInitializedError();
+     }
+@@ -1677,6 +1719,7 @@ Error PS4_SYSV_ABI sceSaveDataTerminate() {
+             instance.reset();
+         }
+     }
++    sceSaveDataUnregisterEventCallback();
+     g_initialized = false;
+     Backup::StopThread();
+     return Error::OK;
+@@ -1717,9 +1760,11 @@ Error PS4_SYSV_ABI sceSaveDataUmountWithBackup(const OrbisSaveDataMountPoint* mo
+     return Umount(mountPoint, true);
+ }
+ 
+-int PS4_SYSV_ABI sceSaveDataUnregisterEventCallback() {
+-    LOG_ERROR(Lib_SaveData, "(STUBBED) called");
+-    return ORBIS_OK;
++Error PS4_SYSV_ABI sceSaveDataUnregisterEventCallback() {
++    std::scoped_lock lock{g_event_callback_mutex};
++    g_event_callback = nullptr;
++    g_event_userdata = nullptr;
++    return Error::OK;
+ }
+ 
+ int PS4_SYSV_ABI sceSaveDataUpload() {
+diff --git a/src/core/libraries/save_data/savedata.h b/src/core/libraries/save_data/savedata.h
+index 37a21db..b83ac2f 100644
+--- a/src/core/libraries/save_data/savedata.h
++++ b/src/core/libraries/save_data/savedata.h
+@@ -151,7 +151,9 @@ int PS4_SYSV_ABI sceSaveDataMountInternal();
+ int PS4_SYSV_ABI sceSaveDataMountSys();
+ int PS4_SYSV_ABI sceSaveDataPromote5();
+ int PS4_SYSV_ABI sceSaveDataRebuildDatabase();
+-int PS4_SYSV_ABI sceSaveDataRegisterEventCallback();
++using OrbisSaveDataEventCallback = void(PS4_SYSV_ABI*)(const OrbisSaveDataEvent*, void*);
++Error PS4_SYSV_ABI sceSaveDataRegisterEventCallback(OrbisSaveDataEventCallback callback,
++                                                    void* userdata);
+ Error PS4_SYSV_ABI sceSaveDataRestoreBackupData(const OrbisSaveDataRestoreBackupData* restore);
+ int PS4_SYSV_ABI sceSaveDataRestoreBackupDataForCdlg();
+ int PS4_SYSV_ABI sceSaveDataRestoreLoadSaveDataMemory();
+@@ -182,7 +184,7 @@ Error PS4_SYSV_ABI sceSaveDataTransferringMount(const OrbisSaveDataTransferringM
+ Error PS4_SYSV_ABI sceSaveDataUmount(const OrbisSaveDataMountPoint* mountPoint);
+ int PS4_SYSV_ABI sceSaveDataUmountSys();
+ Error PS4_SYSV_ABI sceSaveDataUmountWithBackup(const OrbisSaveDataMountPoint* mountPoint);
+-int PS4_SYSV_ABI sceSaveDataUnregisterEventCallback();
++Error PS4_SYSV_ABI sceSaveDataUnregisterEventCallback();
+ int PS4_SYSV_ABI sceSaveDataUpload();
+ int PS4_SYSV_ABI Func_02E4C4D201716422();
+ 
