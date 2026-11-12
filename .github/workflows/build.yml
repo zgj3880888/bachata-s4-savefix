@@ -422,7 +422,7 @@ jobs:
           # Startup diagnostics, proving this build carries the instrumentation rather than
           # only the port. Without these the next round of logs would again be unreadable.
           for s in 'bachata-heartbeat.txt' 'libSceNgs2.sprx is pre-registered at startup' \
-                   '[bachata-diag] heartbeat armed' 'gmain=' 'busy='; do
+                   '[bachata-diag] heartbeat armed' 'gmain=' 'busy=' 'gsys=' 'enosys='; do
             if grep -qaF -- "$s" "$bin"; then echo "OK   diag $s"; else
               echo "MISS diag $s"; fail=1; fi
           done
