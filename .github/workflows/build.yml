@@ -1,171 +1,449 @@
-name: build-savefix-core
+name: build-arm64-core
 
-# Builds the Bachata S4 ARM64 emulator core with the shadPS4 PR #5226 port
-# (save_data backup completion callbacks), then swaps it into the official APK.
+# Cross-compiles the Bachata S4 ARM64 emulator core: the whole Bachata ARM64 port
+# (FEX guest CPU + Android SAF broker + managed patch sessions) rebased onto upstream
+# shadps4-emu/shadPS4 0.21.1. Only the core binary is produced here; swapping it into
+# the APK is a separate step (scripts/repack-runtime.py).
 #
-# Two facts drive the shape of this workflow:
-#   1. The core is cross-compiled with the project's own Debian multiarch script,
-#      which hardcodes CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu -> must run in
-#      a debian:trixie container, not on the Ubuntu runner directly.
-#   2. The APK has no standalone `bin/shadps4-arm64`. The guest userland is one
-#      stored zip at assets/runtime/runtime.zip; the core lives inside it as
-#      host/shadps4-arm64-fex, and three metadata files carry its sha256.
+# Shape notes — each one is load-bearing:
+#   1. The build runs in a debian:trixie *docker* container started from the Ubuntu runner,
+#      not as a job container. The project's cross script hardcodes
+#      CMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu and needs Debian multiarch; running it as
+#      a job container breaks checkout/upload actions and node availability.
+#   2. The base checkout must be the Bachata ARM64 tree: it supplies runtime/scripts,
+#      runtime/locks (the FEX pin), runtime/patches and the Android-specific sources. The
+#      port patch is applied on top, so this job never needs write access to any repo.
+#   3. CORE_REF is a commit SHA, not a branch. The patch is a full-tree diff against this
+#      exact tree; if the base moves, `git apply` must fail loudly instead of half-applying.
+#   4. The APK has no standalone bin/shadps4-arm64. The guest userland is one stored zip at
+#      assets/runtime/runtime.zip and the core lives inside it as host/shadps4-arm64-fex.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
-
-env:
-  CORE_URL: https://github.com/zenithblue-oss/shadps4-arm64.git
-  CORE_REF: main
-  APK_VERSION: v0.2.5
-  APK_URL: https://github.com/JICA98/Bachata-S4/releases/download/v0.2.5/bachatas4-0.2.5-release.apk
-  APK_SHA256: 1df49463f396df8b6f042230bdc1bb9f948b8e69894c378915920875c40ab0ee
 
 permissions:
   contents: read
 
+concurrency:
+  group: arm64-core-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_IMAGE: debian:trixie
+  CORE_URL: https://github.com/Nyces/shadps4-arm64.git
+  # Nyces/shadps4-arm64 main = 2026-10-02 snapshot, the exact base the patch was generated from.
+  CORE_REF: 3d4ff9a9b112cdbec7458b85c76c14db1047f161
+
 jobs:
-  build:
-    name: arm64 core + save_data port
+  core:
+    name: Cross-compile shadps4 0.21.1 (aarch64)
     runs-on: ubuntu-24.04
-    container:
-      image: debian:trixie
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     steps:
-      - name: Bootstrap container
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl
-          git config --global --add safe.directory '*'
-          git --version
+      - name: Checkout port repo
+        uses: actions/checkout@v6
 
-      - name: Free runner disk space
-        # 40+ submodules plus cross-build objects do not fit next to the
+      - name: Free disk space
+        # 48 submodules, a full FEXCore build and cross-build objects do not fit next to the
         # preinstalled runner toolchains.
         run: |
-          rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - name: Checkout port repo
-        uses: actions/checkout@v4
+      - name: Fetch pinned Bachata ARM64 core base
+        run: |
+          set -euo pipefail
+          git init -q core
+          git -C core remote add origin "$CORE_URL"
+          # Fetch by SHA so the base cannot drift under the patch. Falls back to a full branch
+          # fetch in case the server refuses arbitrary-SHA wants.
+          git -C core fetch --no-tags --depth 1 origin "$CORE_REF" ||
+            git -C core fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git -C core checkout -q -B main "$CORE_REF"
+          git -C core log -1 --format='core base: %H %ci %s'
+
+      - name: Apply the 0.21.1 ARM64 port
+        run: bash scripts/apply-port.sh core
+
+      - name: Dump rejects if the port did not apply
+        if: failure()
+        uses: actions/upload-artifact@v7
         with:
-          path: port
+          name: patch-rejects
+          path: |
+            core/**/*.rej
+            core/**/*.orig
+            core/*.log
+          if-no-files-found: ignore
 
-      - name: Clone Bachata ARM64 core (with submodules)
+      - name: Normalise shell line endings
+        # The base tree is maintained on Windows, so scripts can arrive with CRLF. A CRLF
+        # shebang becomes `#!/usr/bin/env bash\r`, which the kernel hands to env as the program
+        # name "bash\r" -> `env: 'bash\r': No such file or directory`, exit 127, before any of
+        # the script runs. Strip CR from every interpreter script in the checkout.
         run: |
-          git clone --depth 1 --branch "$CORE_REF" \
-            --recurse-submodules --shallow-submodules --jobs 8 \
-            "$CORE_URL" core
-          git -C core log -1 --format='core HEAD: %H %ci %s'
+          find core -type f \( -name '*.sh' -o -name '*.py' \) -exec sed -i 's/\r$//' {} + || true
+          echo "--- shebang check ---"
+          for f in core/runtime/scripts/build-shadps4-arm64.sh \
+                   core/runtime/scripts/install-debian-runtime-deps.sh \
+                   core/runtime/scripts/build-fexcore-smoke-aarch64.sh; do
+            printf '%s: ' "$f"; head -c 24 "$f" | od -c | head -1
+          done
 
-      - name: Apply save_data port
-        run: bash port/scripts/apply-port.sh core
-
-      - name: Record applied diff
+      - name: Repair the merge artifacts the port patch carries
+        # The rebase cost four files a closing brace. Consequences are not local: in
+        # vk_instance.h the missing `}` nested the rest of the class inside a function body,
+        # so every later getter lost sight of its members and clang reported a dozen
+        # "undeclared identifier" errors that pointed nowhere near the real line. The same
+        # swallowing happened in CreateDevice(), inside Emulator::Run, and
+        # symbols_resolver.cpp kept the brace of a function that no longer exists.
+        #
+        # Each repair is idempotent: a refreshed patch may already carry the fix (the merged
+        # tree commits them), in which case the pattern is simply absent and the step moves on.
+        # More than one match still fails, because that means the patch drifted.
         run: |
-          git -C core diff --stat | tee port-applied.stat
-          git -C core diff -- src/core/libraries/save_data > port-applied.diff
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import sys
 
-      - name: Install Debian cross-build dependencies
-        working-directory: core
-        run: bash runtime/scripts/install-debian-runtime-deps.sh
+          def repair(path, old, new):
+              p = pathlib.Path(path)
+              data = p.read_bytes()
+              nl = b"\r\n" if b"\r\n" in data[:4000] else b"\n"
+              o = old.replace(b"\n", nl)
+              n = new.replace(b"\n", nl)
+              found = data.count(o)
+              if found == 0:
+                  print(f"already repaired {path}")
+                  return
+              if found != 1:
+                  sys.exit(f"{path}: expected at most 1 match, found {found}")
+              p.write_bytes(data.replace(o, n))
+              print(f"repaired {path}")
 
-      - name: Build arm64 core
-        working-directory: core
+          # 1. vk_instance.h: IsVertexAttributeDivisorSupported() never closed, so the whole
+          #    member block below it stopped being class members.
+          repair("core/src/video_core/renderer_vulkan/vk_instance.h",
+                 b"        return vertex_attribute_divisor;\n"
+                 b"    /// Returns the maximum size of a single VkDeviceMemory",
+                 b"        return vertex_attribute_divisor;\n"
+                 b"    }\n\n"
+                 b"    /// Returns the maximum size of a single VkDeviceMemory")
+
+          # 2. vk_instance.cpp: same shape inside CreateDevice()'s unlink cascade.
+          repair("core/src/video_core/renderer_vulkan/vk_instance.cpp",
+                 b"        device_chain.unlink<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();\n"
+                 b"    if (!maintenance_5) {",
+                 b"        device_chain.unlink<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();\n"
+                 b"    }\n"
+                 b"    if (!maintenance_5) {")
+
+          # 3. emulator.cpp: the failure path lost upstream's quick_exit and its closing brace.
+          repair("core/src/emulator.cpp",
+                 b"                onRuntimeStopped(1);\n"
+                 b"            }\n"
+                 b"#endif\n\n"
+                 b"#ifdef ENABLE_DISCORD_RPC",
+                 b"                onRuntimeStopped(1);\n"
+                 b"            }\n"
+                 b"#endif\n"
+                 b"            std::quick_exit(0);\n"
+                 b"        }\n\n"
+                 b"#ifdef ENABLE_DISCORD_RPC")
+
+          # 4. symbols_resolver.cpp: GenerateName() was removed, its closing brace was not.
+          repair("core/src/core/loader/symbols_resolver.cpp",
+                 b"#endif\n}\n\nconst SymbolRecord* SymbolsResolver::FindSymbol",
+                 b"#endif\n\nconst SymbolRecord* SymbolsResolver::FindSymbol")
+          PY
+          echo "--- brace balance of the repaired files ---"
+          python3 - <<'PY'
+          import pathlib
+          for f in ("core/src/video_core/renderer_vulkan/vk_instance.h",
+                    "core/src/video_core/renderer_vulkan/vk_instance.cpp",
+                    "core/src/emulator.cpp",
+                    "core/src/core/loader/symbols_resolver.cpp"):
+              b = pathlib.Path(f).read_bytes()
+              print(f"  {b.count(b'{') - b.count(b'}'):+d}  {f}")
+          PY
+
+      - name: Arm the ARM64 startup diagnostics
+        # The previous round could not tell a hang from a crash. Two blind spots caused that:
+        # the frontend captures stdout in 4 KiB blocks, so the tail of any run that dies
+        # mid-flight is dropped (the run after libSceNgs2 ended on the half word "[Core"), and
+        # the crash handler wrote nothing at all. This step adds three things to the core:
+        #   * line buffered stdout, so every printed line survives;
+        #   * a 5 s heartbeat file (uptime / RSS / peak / VmSize / thread count), written with
+        #     open+write+close so no buffer can swallow it -- a growing file proves the process
+        #     is alive and spinning, a frozen one proves it died;
+        #   * libSceNgs2 registered at startup rather than on demand, and the on-demand path
+        #     short-circuited, because that path ends in RelocateAllImports() -- a rewrite of
+        #     every guest import thunk while FEX is already executing guest code.
+        # Idempotent: an already instrumented tree is reported and left alone.
+        run: python3 scripts/apply-diagnostics.py core
+
+      - name: Build a host-native glslang shader compiler
+        # Upstream 0.21.1 compiles every host GLSL shader to a SPIR-V header at build time by
+        # marking the generated header DEPENDS on the in-tree `glslang-standalone` target. Under
+        # cross-compilation CMake deliberately refuses to expand a command target into its
+        # on-disk path - the produced binary would be an aarch64 ELF and cannot run on the x86_64
+        # container - so the generated ninja rule keeps the bare target name and the build dies
+        # with `/bin/sh: 1: glslang-standalone: not found`.
+        #
+        # The fix is to give it a runnable one: build the *same* glslang commit (the submodule
+        # pin) natively on the runner and expose it on PATH under that exact name. SPIR-V output
+        # is architecture independent, and the generator version stays bit-identical to the
+        # tree, so no CMakeLists or port patch has to change.
         run: |
-          bash runtime/scripts/build-shadps4-arm64.sh 2>&1 | tee ../build.log
-          tail -20 ../build.log
+          set -euo pipefail
+          cmake -S core/externals/glslang -B core/runtime/build/glslang-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_GLSLANG_BINARIES=ON \
+            -DENABLE_SPIRV=ON \
+            -DENABLE_SPVREMAPPER=OFF \
+            -DENABLE_HLSL=OFF \
+            -DENABLE_OPT=OFF \
+            -DENABLE_PCH=OFF \
+            -DBUILD_EXTERNAL=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DGLSLANG_ENABLE_INSTALL=OFF
+          cmake --build core/runtime/build/glslang-host \
+            --target glslang-standalone -j "$(nproc)"
+          # glslang names the executable target `glslang-standalone` but forces
+          # OUTPUT_NAME=glslang, hence the rename. Keep the link relative so it resolves both on
+          # the runner and inside the container at /workspace.
+          tools="$PWD/core/runtime/build/host-tools"
+          mkdir -p "$tools"
+          ln -sfn ../glslang-host/StandAlone/glslang "$tools/glslang-standalone"
+          PATH="$tools:$PATH" glslang-standalone --version
+          ls -l "$tools/glslang-standalone"
+
+      - name: Build a host-native protoc for shadnet codegen
+        # Same class of problem as the host shaders: 0.21.1 generates shadnet.pb.{cc,h} through
+        # `COMMAND protobuf::protoc`. That imported target is cross-compiled to aarch64, CMake
+        # will not expand it to a path while cross-compiling, and the rule keeps the bare name
+        # -> `/bin/sh: 1: protobuf::protoc: not found`.
+        #
+        # There is no PATH trick here that stays honest: generated protobuf code is version
+        # locked to the runtime headers, and the tree pins protobuf 36-dev. A distro protoc
+        # would be rejected by the generated `#if PROTOBUF_VERSION` guards, so the generator has
+        # to come from the same source. Build it natively, then point the rule at it. abseil is
+        # pulled by protobuf's own FetchContent at its pinned tag.
+        run: |
+          set -euo pipefail
+          test -f core/externals/protobuf/third_party/utf8_range/CMakeLists.txt || {
+            echo "protobuf third_party/utf8_range is missing; submodules were not fully filled in"
+            exit 1
+          }
+          host=core/runtime/build/protobuf-host
+          cmake -S core/externals/protobuf -B "$host" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17 \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_BUILD_EXAMPLES=OFF \
+            -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+            -Dprotobuf_BUILD_PROTOC_BINARIES=ON \
+            -Dprotobuf_WITH_ZLIB=OFF \
+            -Dprotobuf_INSTALL=OFF
+          cmake --build "$host" --target protoc -j "$(nproc)"
+          tools=core/runtime/build/host-tools
+          mkdir -p "$tools"
+          ln -sfn ../protobuf-host/protoc "$tools/protoc"
+          "$tools/protoc" --version
+          # Rewrite the one rule that names the imported target. CMAKE_SOURCE_DIR is the repo
+          # root both on the runner and inside the container, so this path stays valid.
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path("core/CMakeLists.txt")
+          text = path.read_text()
+          old = "COMMAND protobuf::protoc"
+          if text.count(old) != 1:
+              sys.exit(f"expected exactly one protobuf::protoc rule, found {text.count(old)}")
+          path.write_text(
+              text.replace(old, "COMMAND ${CMAKE_SOURCE_DIR}/runtime/build/host-tools/protoc")
+          )
+          print("shadnet protoc rule now uses the native generator")
+          PY
+          grep -n "host-tools/protoc" core/CMakeLists.txt
+
+      - name: Build ARM64 core inside Debian trixie container
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace/core \
+            "${DEBIAN_IMAGE}" \
+            bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends git ca-certificates
+              git config --global --add safe.directory "*"
+              # The host shader generator: native x86_64 glslang built on the runner, exposed
+              # under the target name the project asks for.
+              export PATH="/workspace/core/runtime/build/host-tools:$PATH"
+              command -v glslang-standalone
+              glslang-standalone --version
+              bash runtime/scripts/install-debian-runtime-deps.sh
+              if ! bash runtime/scripts/build-shadps4-arm64.sh; then
+                # One failed round costs half an hour, and clang stops at the first error in
+                # every TU it touches. Re-run the same build with keep-going so every remaining
+                # bad TU shows up in a single log, then replay *every* failure with the error
+                # limit lifted: default clang caps a TU at 20 diagnostics, which hides the
+                # cascade a half-applied merge produces.
+                #
+                # The replay is de-duplicated by error signature instead of truncated, because
+                # most failing TUs here are collateral damage from one broken header -- seeing
+                # the same "no member named X" 40 times buries the two genuinely distinct
+                # errors underneath it.
+                echo "=== keep-going pass: surface every failing TU ==="
+                cd runtime/build/shadps4-arm64
+                set +e
+                ninja -k 0 -j "$(nproc)" > /tmp/keepgoing.log 2>&1
+                grep "^FAILED:" /tmp/keepgoing.log | sed "s/^FAILED: //" | sort -u > /tmp/failed.txt
+                echo "failing targets: $(wc -l < /tmp/failed.txt)"
+                cat /tmp/failed.txt
+                : > /tmp/signatures.txt
+                while read -r obj; do
+                  [ -n "$obj" ] || continue
+                  cmd=$(ninja -t commands "$obj" 2>/dev/null | tail -1)
+                  [ -n "$cmd" ] || continue
+                  # -ferror-limit=0 lifts the cap; -fno-caret-diagnostics drops the source
+                  # echo lines so a signature fits on one grep-able line.
+                  eval "$cmd -ferror-limit=0 -fno-caret-diagnostics -fno-diagnostics-show-option" \
+                    > /tmp/tu.log 2>&1
+                  # Keep the first diagnostic per unique message. Preserve the file:line that
+                  # produced it, and remember which TU it came from.
+                  grep -E "error:|fatal error:" /tmp/tu.log |
+                    sed -E "s/^([^:]+:[0-9]+:[0-9]+: )//" |
+                    sort -u |
+                    while IFS= read -r sig; do
+                      if ! grep -qxF "$sig" /tmp/signatures.txt; then
+                        printf "%s\n" "$sig" >> /tmp/signatures.txt
+                        printf "  [%s] %s\n" "$(basename "$obj" .o)" "$sig"
+                      fi
+                    done
+                done < /tmp/failed.txt
+                echo "=== distinct error signatures: $(wc -l < /tmp/signatures.txt) ==="
+                echo "=== per-TU first 6 diagnostics, for locating the origin ==="
+                n=0
+                while read -r obj; do
+                  [ -n "$obj" ] || continue
+                  n=$((n + 1))
+                  [ "$n" -le 30 ] || break
+                  cmd=$(ninja -t commands "$obj" 2>/dev/null | tail -1)
+                  [ -n "$cmd" ] || continue
+                  echo "--- $obj"
+                  eval "$cmd -ferror-limit=0 -fno-diagnostics-show-option" 2>&1 |
+                    grep -E "error:|fatal error:" | head -6
+                done < /tmp/failed.txt
+                echo "=== keep-going tail ==="
+                tail -25 /tmp/keepgoing.log
+                echo "=== diagnostics: libc_internal_io.cpp symbol table ==="
+                # The link step reports ForceRegisterlibSceLibcInternalIo as undefined even
+                # though the definition is in the tree and the TU compiles. Print what the
+                # compiler actually emitted, plus the source shape, so the next round can tell
+                # a dropped definition apart from a wrong namespace or a stale object file.
+                io=CMakeFiles/shadps4.dir/src/core/libraries/libc_internal/libc_internal_io.cpp.o
+                if [ -f "$io" ]; then
+                  nm -C "$io" 2>/dev/null |
+                    grep -E "RegisterlibSceLibcInternal|ForceRegister" ||
+                    echo "  (no Register*/ForceRegister* symbols in $io)"
+                  ls -l "$io"
+                else
+                  echo "  $io missing"
+                fi
+                echo "--- source tail"
+                tail -20 ../src/core/libraries/libc_internal/libc_internal_io.cpp
+                echo "--- grep ForceRegister in source"
+                grep -n "ForceRegister" ../src/core/libraries/libc_internal/libc_internal_io.cpp || echo "  (absent)"
+                echo "--- header decl"
+                grep -n "ForceRegister" ../src/core/libraries/libc_internal/libc_internal_io.h || echo "  (absent)"
+                exit 1
+              fi
+            ' 2>&1 | tee build.log
+          tail -30 build.log
 
       - name: Verify and strip produced ELF
         run: |
+          set -euo pipefail
+          # binutils lives inside the container image, so the strip pass runs there too.
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace/core \
+            "${DEBIAN_IMAGE}" \
+            bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              # binutils-aarch64-linux-gnu only ships aarch64-linux-gnu-*; the plain readelf
+              # lives in binutils, and each docker run starts from a clean image.
+              apt-get install -y --no-install-recommends binutils binutils-aarch64-linux-gnu file
+              bin=runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
+              ls -la "$bin"
+              file "$bin"
+              readelf -h "$bin" | grep -E "Class|Machine"
+              readelf -l "$bin" | grep -F "/lib/ld-linux-aarch64.so.1"
+              before=$(stat -c %s "$bin")
+              aarch64-linux-gnu-strip --strip-debug "$bin"
+              after=$(stat -c %s "$bin")
+              echo "--- strip: ${before} -> ${after} bytes ---"
+              ls -la "$bin"
+              cat runtime/build/shadps4-arm64-stage/needed.txt
+            '
+
+      - name: Verify the port actually landed in the binary
+        run: |
+          set -euo pipefail
           bin=core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64
-          ls -la "$bin"
-          file "$bin"
-          readelf -h "$bin" | grep -E 'Class|Machine'
-          readelf -l "$bin" | grep -F '/lib/ld-linux-aarch64.so.1'
-          cp "$bin" unstripped-copy
-          aarch64-linux-gnu-strip --strip-debug "$bin"
-          echo "--- after strip ---"
-          ls -la "$bin" unstripped-copy
-          cat core/runtime/build/shadps4-arm64-stage/needed.txt
-          sha256sum "$bin" | tee shadps4-arm64.sha256
+          fail=0
+          # Every pattern here is matched literally against a binary, so -- (end of options) is
+          # mandatory: the CLI strings start with "--bachata", which grep would otherwise treat
+          # as flags and fail on before it ever opens the binary.
+          # CLI contract the Bachata S4+ frontend uses when it launches the core.
+          for s in '--bachata-socket' '--bachata-storage-root' '--bachata-saf-socket' \
+                   '--bachata-saf-token' '--patch-session'; do
+            if grep -qaF -- "$s" "$bin"; then echo "OK   cli $s"; else echo "MISS cli $s"; fail=1; fi
+          done
+          # Android platform glue: SAF broker, FEX guest CPU, managed patch sessions.
+          for s in 'saf-mirror' 'PATCH_SESSION_LOAD' 'PATCH_APPLIED' 'BACHATA_FEX_SIGNAL' \
+                   'BACHATA_INPUT motion'; do
+            if grep -qaF -- "$s" "$bin"; then echo "OK   glue $s"; else echo "MISS glue $s"; fail=1; fi
+          done
+          # Upstream 0.21.1 identity, proving this is not the 2026-06 base tree.
+          if grep -qaF -- 'libSceJpegDec.sprx' "$bin"; then echo "OK   base libSceJpegDec"; else
+            echo "MISS base libSceJpegDec"; fail=1; fi
+          # Startup diagnostics, proving this build carries the instrumentation rather than
+          # only the port. Without these the next round of logs would again be unreadable.
+          for s in 'bachata-heartbeat.txt' 'libSceNgs2.sprx is pre-registered at startup'; do
+            if grep -qaF -- "$s" "$bin"; then echo "OK   diag $s"; else
+              echo "MISS diag $s"; fail=1; fi
+          done
+          [ "$fail" -eq 0 ] || { echo "core does not match expectations"; exit 1; }
 
-      - name: Stage artifacts
+      - name: Stage named artifact
         run: |
-          mkdir -p out
-          cp core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64 out/
-          cp core/runtime/build/shadps4-arm64-stage/needed.txt out/
-          cp shadps4-arm64.sha256 port-applied.stat port-applied.diff build.log out/
-          ls -la out
+          set -euo pipefail
+          name="shadps4-arm64-021-$(date -u +%Y-%m-%d)-$(git -C core rev-parse --short HEAD)"
+          echo "ARTIFACT_NAME=$name" >> "$GITHUB_ENV"
+          mkdir -p artifact
+          cp core/runtime/build/shadps4-arm64-stage/bin/shadps4-arm64 "artifact/$name"
+          cp core/runtime/build/shadps4-arm64-stage/needed.txt "artifact/$name-needed.txt"
+          sha256sum "artifact/$name" | tee "artifact/$name.sha256"
+          # Keep the log bounded: a full cross-build log runs to tens of MB and the interesting
+          # part is always the tail.
+          tail -c 3000000 build.log > artifact/build.log || true
+          ls -l artifact
 
-      - name: Upload patched core binary
-        uses: actions/upload-artifact@v4
+      - name: Upload ARM64 core artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: shadps4-arm64-savefix
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifact/
           if-no-files-found: error
-          path: out/
-
-  repack-apk:
-    name: Swap core into official APK
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch patched core
-        uses: actions/download-artifact@v4
-        with:
-          name: shadps4-arm64-savefix
-          path: out
-
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            python3 zipalign apksigner unzip curl
-          zipalign -h >/dev/null 2>&1 || true
-          apksigner version
-
-      - name: Download official APK
-        run: |
-          curl -sSL --retry 3 -o app.apk "$APK_URL"
-          echo "$APK_SHA256  app.apk" | sha256sum -c -
-
-      - name: Swap core inside assets/runtime/runtime.zip
-        run: |
-          python3 scripts/repack-runtime.py \
-            app.apk out/shadps4-arm64 patched-unaligned.apk \
-            --needed out/needed.txt 2>&1 | tee repack.log
-
-      - name: Align
-        run: |
-          zipalign -p -f 4 patched-unaligned.apk patched-aligned.apk
-          echo "--- alignment check ---"
-          zipalign -c -p 4 patched-aligned.apk && echo "align OK"
-
-      - name: Sign
-        run: |
-          keytool -genkeypair -keystore savefix.jks -alias savefix \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass savefix123 -keypass savefix123 \
-            -dname "CN=Bachata S4 SaveFix, OU=port, O=local, C=CN" 2>/dev/null
-          apksigner sign --ks savefix.jks --ks-pass pass:savefix123 \
-            --key-pass pass:savefix123 --out patched.apk patched-aligned.apk
-          echo "--- verify ---"
-          apksigner verify --print-certs --verbose patched.apk | tee verify.log
-          sha256sum patched.apk | tee patched.sha256
-          ls -la patched.apk
-
-      - name: Upload repacked APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: bachata-s4-savefix-apk
-          if-no-files-found: error
-          path: |
-            patched.apk
-            patched.sha256
-            verify.log
-            repack.log

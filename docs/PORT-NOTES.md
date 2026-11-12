@@ -1,5 +1,18 @@
 # 移植说明与技术报告
 
+> **状态更新（2026-11-10 20:30）—— 本文已降级为历史记录。**
+> 仓库现在做的是**整套 ARM64 移植合上游 0.21.1**：把 Bachata 的 FEX guest CPU + Android SAF
+> 改造搬到官方 `shadps4-emu/shadPS4` 0.21.1 骨架上。原先那个 save_data 备份回调补丁
+> （PR #5226 / +101−23）**已被上游内置**，仓库里不再包含它。
+> 当前构建流程、产物与换包方式见 `README.md` 与 `docs/UPLOAD.md`。
+
+> **状态更新（2026-11-07 20:30）**：本文保留移植过程的推理记录，其中关于"改包"的
+> 部分已被实测推翻并重写 —— 官方 APK 里并没有独立的 `bin/shadps4-arm64`，内核在
+> `assets/runtime/runtime.zip` 内名为 `host/shadps4-arm64-fex`，且需同步
+> `guest-runtime.json` / `guest-runtime.txt` / `*-needed.txt` / `manifest.json` 四处的
+> 哈希。**以 `README.md` 和 `scripts/repack-runtime.py` 为准。**
+> 实测结果：编译与改包均成功，产物 `patched.apk` 216,709,921 B。
+
 ## 1. 事实基础（全部有出处）
 
 | 项 | 内容 | 出处 |

@@ -3,11 +3,11 @@
 #
 # 前提：本机装了 GitHub CLI 并已登录（gh auth login）。
 # 用法：
-#   bash scripts/push-local.sh                 # 仓库名默认 bachata-s4-savefix
+#   bash scripts/push-local.sh                 # 仓库名默认 shadps4-arm64-021
 #   bash scripts/push-local.sh my-repo-name
 set -euo pipefail
 
-repo_name=${1:-bachata-s4-savefix}
+repo_name=${1:-shadps4-arm64-021}
 repo_root=$(builtin cd -- "${BASH_SOURCE[0]%/*}/.." && builtin pwd -P)
 
 cd "$repo_root"
