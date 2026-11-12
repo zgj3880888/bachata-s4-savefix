@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """Arm the ARM64 core's startup diagnostics on a checked-out (already ported) core tree.
 
-Three independent, idempotent edits. Each one exists because the previous round could not
-tell a hang from a crash, and the strongest suspect is the only HLE library that upstream
-registers mid-run.
+Everything lives in one header that is copied in, so each call site is a single line and the
+inline variables give every translation unit the same counter instances.
 
-1. src/main.cpp
-   * stdout becomes line buffered. The frontend captures the core's stdout in 4 KiB blocks,
-     so any run that dies mid-flight loses its tail -- the round that hung after
-     `libSceNgs2` ended on the half word `[Core`, which is exactly a partial block.
-   * a detached thread appends `t=<ms> rss= peak= vm= thr=` to
-     /sdcard/Download/bachata-logs/bachata-heartbeat.txt every 5 s, open/write/close each
-     time so nothing is buffered. A growing file proves the process is alive (hang, or a
-     renderer that never presents); a file that stops proves it died. The RSS/thread columns
-     make an OOM kill or a thread leak visible without a debugger.
+The counters and the heartbeat answer the question the log cannot. After the libX11 fix the core
+gets through SDL, allocates guest memory, spawns guest threads, and then stops producing output
+while the process stays alive. `BACHATA_FLIP_TRACE` proves the guest never submitted a single
+flip, so nothing is being presented -- but that alone does not say whether the guest is spinning
+or blocked. So the heartbeat line carries:
 
-2. src/core/libraries/libs.cpp
-   Register libSceNgs2 next to libSceAudioOut in InitHLELibs, i.e. at startup, instead of
-   leaving it to the on-demand path in the sysmodule library.
+  cpu=%    process CPU over the last 5 s     -> near 0 means blocked, high means spinning
+  gmain=%  CPU of the "Game:Main" thread     -> isolates the guest main thread from the rest
+  st=R/S/D thread state histogram            -> all S with a futex wchan means deadlock
+  busy=    names of threads actually running -> says *who* is spinning
+  w=       top kernel wait points            -> futex_wait vs epoll_wait vs io
+  flip/pres/gnm/blank                      -> how far the flip pipeline got
 
-3. src/core/libraries/sysmodule/sysmodule_internal.cpp
-   When the game asks for libSceNgs2 and the .sprx is absent, upstream registers the HLE and
-   then calls RelocateAllImports() -- a rewrite of every guest import thunk. That runs while
-   FEX is already executing guest code, and it is the last thing this core logs. Since (2)
-   already registered the library, skip the hot reload; the symbols are in place.
+Edits, all idempotent:
+
+1. src/common/bachata_diag.h is copied from overlay/ (new file, header-only).
+2. src/main.cpp      -- line-buffered stdout + heartbeat thread start.
+3. src/core/libraries/libs.cpp -- register libSceNgs2 at startup.
+4. src/core/libraries/sysmodule/sysmodule_internal.cpp -- skip the hot HLE reload of Ngs2,
+   which is the only mid-run RelocateAllImports() upstream performs.
+5. src/core/libraries/videoout/driver.cpp -- flip/present/blank counters.
+6. src/core/libraries/gnmdriver/gnmdriver.cpp -- command buffer submit counter.
 
 Usage: scripts/apply-diagnostics.py <core-dir>
 """
@@ -31,8 +33,10 @@ Usage: scripts/apply-diagnostics.py <core-dir>
 import pathlib
 import sys
 
-MARK_MAIN = b"BachataStartHeartbeat"
-MARK_NGS2 = b"libSceNgs2.sprx is pre-registered at startup"
+MARK = b"BachataDiag::"
+
+HEADER_SRC = pathlib.Path(__file__).resolve().parent.parent / "overlay/src/common/bachata_diag.h"
+HEADER_DST = "src/common/bachata_diag.h"
 
 
 def read(path):
@@ -70,95 +74,22 @@ def edit(path, pairs, marker=None, note=""):
 # ---------------------------------------------------------------------------------------------
 # 1. src/main.cpp -- line buffered stdout + heartbeat thread
 # ---------------------------------------------------------------------------------------------
-MAIN_INCLUDES_OLD = b"""#include <array>
-#include <atomic>
+MAIN_INCLUDE_OLD = b"""#include "common/key_manager.h"
+#include "common/logging/log.h"
 """
 
-MAIN_INCLUDES_NEW = b"""#include <array>
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <thread>
+MAIN_INCLUDE_NEW = b"""#include "common/bachata_diag.h"
+#include "common/key_manager.h"
+#include "common/logging/log.h"
 """
 
-MAIN_ANCHOR_OLD = b"""int main(int argc, char* argv[]) {
+MAIN_ENTRY_OLD = b"""int main(int argc, char* argv[]) {
 """
 
-MAIN_ANCHOR_NEW = b"""#if defined(__linux__) && defined(ENABLE_BACHATA_RUNTIME)
-// The frontend captures stdout in 4 KiB blocks, so a run that dies mid-flight always loses its
-// tail. The round that hung after libSceNgs2 ended on the half word "[Core". Line buffering fixes
-// that, and an unbuffered heartbeat on its own file answers the question the log cannot: is the
-// process alive and spinning, or gone?
-namespace {
-std::chrono::steady_clock::time_point g_bachata_epoch;
-
-void BachataHeartbeatTick() {
-    const int fd = ::open("/sdcard/Download/bachata-logs/bachata-heartbeat.txt",
-                          O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) {
-        return;
-    }
-
-    long rss_kb = 0;
-    long peak_kb = 0;
-    long vm_kb = 0;
-    long threads = 0;
-    if (FILE* status = std::fopen("/proc/self/status", "re")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), status) != nullptr) {
-            if (std::strncmp(line, "VmRSS:", 6) == 0) {
-                rss_kb = std::strtol(line + 6, nullptr, 10);
-            } else if (std::strncmp(line, "VmHWM:", 6) == 0) {
-                peak_kb = std::strtol(line + 6, nullptr, 10);
-            } else if (std::strncmp(line, "VmSize:", 7) == 0) {
-                vm_kb = std::strtol(line + 7, nullptr, 10);
-            } else if (std::strncmp(line, "Threads:", 8) == 0) {
-                threads = std::strtol(line + 8, nullptr, 10);
-            }
-        }
-        std::fclose(status);
-    }
-
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - g_bachata_epoch)
-                             .count();
-    char buf[256];
-    const int len = std::snprintf(
-        buf, sizeof(buf), "t=%8lldms rss=%5ldMB peak=%5ldMB vm=%6ldMB thr=%ld\\n",
-        static_cast<long long>(elapsed), rss_kb / 1024, peak_kb / 1024, vm_kb / 1024, threads);
-    if (len > 0) {
-        ::write(fd, buf, static_cast<size_t>(len));
-    }
-    ::close(fd);
-}
-
-// Must run before anything writes to stdout, hence the split: this part goes first thing in main,
-// the heartbeat starts once the log directory exists.
-void BachataUnbufferLogs() {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IONBF, 0);
-}
-
-void BachataStartHeartbeat() {
-    g_bachata_epoch = std::chrono::steady_clock::now();
-    std::thread([] {
-        BachataHeartbeatTick();
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            BachataHeartbeatTick();
-        }
-    }).detach();
-    std::fprintf(stderr, "[bachata-diag] heartbeat armed every 5s\\n");
-}
-} // namespace
-#endif
-
-int main(int argc, char* argv[]) {
-#if defined(__linux__) && defined(ENABLE_BACHATA_RUNTIME)
-    BachataUnbufferLogs();
-#endif
+MAIN_ENTRY_NEW = b"""int main(int argc, char* argv[]) {
+    // Line buffered before anything else writes: the frontend captures stdout in 4 KiB blocks,
+    // so an unbuffered tail is what makes a late failure invisible.
+    BachataDiag::UnbufferLogs();
 """
 
 MAIN_HEARTBEAT_OLD = b"""    InstallBachataCrashHandlers();
@@ -170,7 +101,8 @@ MAIN_HEARTBEAT_OLD = b"""    InstallBachataCrashHandlers();
 MAIN_HEARTBEAT_NEW = b"""    InstallBachataCrashHandlers();
     BachataSetupReadableLogDir();
     BachataSetupSaveLocation();
-    BachataStartHeartbeat();
+    // Starts here because the log directory has to exist before the first write.
+    BachataDiag::StartHeartbeat();
 #endif
 """
 
@@ -194,8 +126,7 @@ LIBS_REGISTER_NEW = b"""            {"libSceAudioOut.sprx", Libraries::AudioOut:
             {"libSceAudioIn.sprx", Libraries::AudioIn::RegisterLib},
             // Bachata: registered here rather than on demand. libSceNgs2 is the only sizeable
             // HLE upstream resolves mid-run, and that path ends in RelocateAllImports(), which
-            // rewrites every guest import thunk while FEX is already executing guest code. It
-            // is the last thing this core logs before it stops producing output.
+            // rewrites every guest import thunk while FEX is already executing guest code.
             {"libSceNgs2.sprx", Libraries::Ngs2::RegisterLib},
 """
 
@@ -215,7 +146,7 @@ SYSMOD_NEW = b"""                LOG_INFO(Loader, "Can't Load {} switching to HL
                     // Bachata: libSceNgs2 is registered by InitHLELibs at startup, so the hot
                     // path is not needed. Running it here would also call RelocateAllImports(),
                     // rewriting every guest import thunk while FEX is already executing guest
-                    // code -- the exact point this core stops.
+                    // code.
                     LOG_INFO(Loader, "libSceNgs2.sprx is pre-registered at startup, skipping "
                                      "hot HLE reload");
                 } else {
@@ -227,33 +158,124 @@ SYSMOD_NEW = b"""                LOG_INFO(Loader, "Can't Load {} switching to HL
                 }
 """
 
+# ---------------------------------------------------------------------------------------------
+# 4. videoout/driver.cpp -- flip / present / blank counters
+# ---------------------------------------------------------------------------------------------
+DRV_INCLUDE_OLD = b"""#include "common/assert.h"
+#include "common/debug.h"
+"""
+
+DRV_INCLUDE_NEW = b"""#include "common/assert.h"
+#include "common/bachata_diag.h"
+#include "common/debug.h"
+"""
+
+DRV_FLIP_OLD = b"""void VideoOutDriver::Flip(const Request& req) {
+    if (present_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
+"""
+
+DRV_FLIP_NEW = b"""void VideoOutDriver::Flip(const Request& req) {
+    BachataDiag::presents.fetch_add(1, std::memory_order_relaxed);
+    if (present_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
+"""
+
+DRV_SUBMIT_OLD = b"""                                bool is_eop /*= false*/, u64 lock_generation) {
+    if (submit_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
+"""
+
+DRV_SUBMIT_NEW = b"""                                bool is_eop /*= false*/, u64 lock_generation) {
+    BachataDiag::flips.fetch_add(1, std::memory_order_relaxed);
+    if (submit_traces.fetch_add(1, std::memory_order_relaxed) < 32) {
+"""
+
+DRV_BLANK_OLD = b"""void VideoOutDriver::DrawBlankFrame() {
+"""
+
+DRV_BLANK_NEW = b"""void VideoOutDriver::DrawBlankFrame() {
+    BachataDiag::blanks.fetch_add(1, std::memory_order_relaxed);
+"""
+
+# ---------------------------------------------------------------------------------------------
+# 5. gnmdriver.cpp -- command buffer submit counter
+# ---------------------------------------------------------------------------------------------
+GNM_INCLUDE_OLD = b"""#include "common/assert.h"
+#include "common/debug.h"
+"""
+
+GNM_INCLUDE_NEW = b"""#include "common/assert.h"
+#include "common/bachata_diag.h"
+#include "common/debug.h"
+"""
+
+GNM_SUBMIT_OLD = b"""                                                       u32* ccb_sizes_in_bytes) {
+    HLE_TRACE;
+"""
+
+GNM_SUBMIT_NEW = b"""                                                       u32* ccb_sizes_in_bytes) {
+    // Every guest frame starts here; a zero count after minutes of uptime means the guest never
+    // reached its first submit, so present() cannot possibly run.
+    BachataDiag::gnm_submits.fetch_add(1, std::memory_order_relaxed);
+    HLE_TRACE;
+"""
+
 
 def main():
     if len(sys.argv) != 2:
         sys.exit("usage: apply-diagnostics.py <core-dir>")
     core = pathlib.Path(sys.argv[1])
 
-    edit(core / "src/main.cpp",
-         [(MAIN_INCLUDES_OLD, MAIN_INCLUDES_NEW), (MAIN_ANCHOR_OLD, MAIN_ANCHOR_NEW),
-          (MAIN_HEARTBEAT_OLD, MAIN_HEARTBEAT_NEW)],
-         marker=MARK_MAIN, note="(heartbeat + line buffered stdout)")
+    # 1. header
+    src = read(HEADER_SRC)
+    dst = core / HEADER_DST
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    payload = src.read_bytes().replace(b"\r\n", b"\n")
+    if dst.is_file() and dst.read_bytes() == payload:
+        print(f"already applied {dst} (diagnostics header)")
+    else:
+        dst.write_bytes(payload)
+        print(f"wrote {dst} ({len(payload)} bytes)")
 
+    # 2. main.cpp
+    edit(core / "src/main.cpp",
+         [(MAIN_INCLUDE_OLD, MAIN_INCLUDE_NEW), (MAIN_ENTRY_OLD, MAIN_ENTRY_NEW),
+          (MAIN_HEARTBEAT_OLD, MAIN_HEARTBEAT_NEW)],
+         marker=MARK, note="(heartbeat + line buffered stdout)")
+
+    # 3. libs.cpp
     edit(core / "src/core/libraries/libs.cpp",
          [(LIBS_INCLUDE_OLD, LIBS_INCLUDE_NEW), (LIBS_REGISTER_OLD, LIBS_REGISTER_NEW)],
          marker=b"Libraries::Ngs2::RegisterLib},",
          note="(libSceNgs2 pre-registered)")
 
+    # 4. sysmodule_internal.cpp
     edit(core / "src/core/libraries/sysmodule/sysmodule_internal.cpp",
          [(SYSMOD_OLD, SYSMOD_NEW)],
-         marker=MARK_NGS2, note="(hot HLE reload skipped for Ngs2)")
+         marker=b"libSceNgs2.sprx is pre-registered at startup",
+         note="(hot HLE reload skipped for Ngs2)")
+
+    # 5. videoout/driver.cpp
+    edit(core / "src/core/libraries/videoout/driver.cpp",
+         [(DRV_INCLUDE_OLD, DRV_INCLUDE_NEW), (DRV_FLIP_OLD, DRV_FLIP_NEW),
+          (DRV_SUBMIT_OLD, DRV_SUBMIT_NEW), (DRV_BLANK_OLD, DRV_BLANK_NEW)],
+         marker=b"BachataDiag::presents", note="(flip/present/blank counters)")
+
+    # 6. gnmdriver.cpp
+    edit(core / "src/core/libraries/gnmdriver/gnmdriver.cpp",
+         [(GNM_INCLUDE_OLD, GNM_INCLUDE_NEW), (GNM_SUBMIT_OLD, GNM_SUBMIT_NEW)],
+         marker=b"BachataDiag::gnm_submits", note="(gnm submit counter)")
 
     # Cheap sanity pass: the strings the CI verifier greps for in the binary.
     print("--- diagnostics check ---")
     for path, needle in (
-        (core / "src/main.cpp", MARK_MAIN),
-        (core / "src/main.cpp", b"bachata-heartbeat.txt"),
-        (core / "src/core/libraries/libs.cpp", b'{"libSceNgs2.sprx", Libraries::Ngs2::RegisterLib}'),
-        (core / "src/core/libraries/sysmodule/sysmodule_internal.cpp", MARK_NGS2),
+        (core / "src/common/bachata_diag.h", b"bachata-heartbeat.txt"),
+        (core / "src/main.cpp", b"BachataDiag::StartHeartbeat"),
+        (core / "src/main.cpp", b"BachataDiag::UnbufferLogs"),
+        (core / "src/core/libraries/libs.cpp",
+         b'{"libSceNgs2.sprx", Libraries::Ngs2::RegisterLib}'),
+        (core / "src/core/libraries/sysmodule/sysmodule_internal.cpp",
+         b"is pre-registered at startup"),
+        (core / "src/core/libraries/videoout/driver.cpp", b"BachataDiag::presents"),
+        (core / "src/core/libraries/gnmdriver/gnmdriver.cpp", b"BachataDiag::gnm_submits"),
     ):
         ok = needle in path.read_bytes()
         print(f"  {'OK  ' if ok else 'MISS'} {path.relative_to(core)} :: {needle.decode()}")
