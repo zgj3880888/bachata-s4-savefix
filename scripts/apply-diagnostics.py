@@ -367,6 +367,74 @@ AUDIO_OPEN_NEW = b"""                                 OrbisAudioOutParamExtended
     LOG_INFO(Lib_AudioOut,
 """
 
+# ---------------------------------------------------------------------------------------------
+# 9. libc_internal: actually wire up the FEX "libc" aliases
+#
+# Root cause found on 2026-11-13 from a clean r19 capture: the guest's very first
+# allocation returned -38. linker.cpp:873 hands out UnsupportedHleCallAdapter for anything
+# that is not in the HLE table, and that adapter returns HleCallFailure{ENOSYS, Name()}.
+# `malloc`, `free`, `strlen`, `memcpy_s` were all in that state -- 753 such warnings in one
+# 120 s run, and the guest's startup stalls right after the last CreateStack because every
+# allocation afterwards yields an unusable pointer.
+#
+# The aliases existed in the tree (RegisterFexLibcMemoryAliases / ...StrAliases / ...CxaAliases)
+# but were only reachable through ForceRegisterLib(), and nothing ever called that -- the sole
+# registration entry point in use is linker.cpp:489 -> LibcInternal::RegisterLib(). So the fix
+# is two-part: register the aliases from RegisterLib (where they are guaranteed to land before
+# any guest module is relocated), and give malloc/calloc/realloc/free real implementations.
+# ---------------------------------------------------------------------------------------------
+
+LIBC_REG_OLD = b"""    RegisterlibSceLibcInternalIo(sym);
+    RegisterlibSceLibcInternalThreads(sym);
+}"""
+
+LIBC_REG_NEW = b"""    RegisterlibSceLibcInternalIo(sym);
+    RegisterlibSceLibcInternalThreads(sym);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    // FEX paths call libc through the veneer, so the "libc" aliases have to be registered
+    // explicitly. They used to be reachable only via ForceRegisterLib(), which nothing called.
+    RegisterFexLibcMemoryAliases(sym);
+    RegisterFexLibcMathAliases(sym);
+    RegisterFexLibcStrAliases(sym);
+    RegisterFexLibcCxaAliases(sym);
+#endif
+}"""
+
+LIBC_MEM_ANCHOR_OLD = b"""void RegisterFexLibcMemoryAliases(Core::Loader::SymbolsResolver* sym) {
+    LIB_FUNCTION("Q3VBxCXhUHs", "libc", 1, "libc", internal_memcpy);
+    LIB_FUNCTION("8zTFvBIAIN8", "libc", 1, "libc", internal_memset);
+    LIB_FUNCTION("DfivPArhucg", "libc", 1, "libc", internal_memcmp);
+}"""
+
+LIBC_MEM_ANCHOR_NEW = b"""void* PS4_SYSV_ABI bachata_fex_malloc(size_t size) {
+    return std::malloc(size == 0 ? 1 : size);
+}
+
+void* PS4_SYSV_ABI bachata_fex_calloc(size_t nelem, size_t size) {
+    return std::calloc(nelem == 0 ? 1 : nelem, size == 0 ? 1 : size);
+}
+
+void* PS4_SYSV_ABI bachata_fex_realloc(void* ptr, size_t size) {
+    return std::realloc(ptr, size == 0 ? 1 : size);
+}
+
+void PS4_SYSV_ABI bachata_fex_free(void* ptr) {
+    std::free(ptr);
+}
+
+void RegisterFexLibcMemoryAliases(Core::Loader::SymbolsResolver* sym) {
+    LIB_FUNCTION("Q3VBxCXhUHs", "libc", 1, "libc", internal_memcpy);
+    LIB_FUNCTION("8zTFvBIAIN8", "libc", 1, "libc", internal_memset);
+    LIB_FUNCTION("DfivPArhucg", "libc", 1, "libc", internal_memcmp);
+    LIB_FUNCTION("+P6FRGH4LfA", "libc", 1, "libc", internal_memmove);
+    LIB_FUNCTION("NFLs+dRJGNg", "libc", 1, "libc", internal_memcpy_s);
+    // NIDs computed with scripts/ps4_names2stubs.py (verified against memcpy/memset/memcmp).
+    LIB_FUNCTION("gQX+4GDQjpM", "libc", 1, "libc", bachata_fex_malloc);
+    LIB_FUNCTION("2X5agFjKxMc", "libc", 1, "libc", bachata_fex_calloc);
+    LIB_FUNCTION("Y7aJ1uydPMo", "libc", 1, "libc", bachata_fex_realloc);
+    LIB_FUNCTION("tIhsqj0qsFE", "libc", 1, "libc", bachata_fex_free);
+}"""
+
 
 def main():
     if len(sys.argv) != 2:
@@ -437,6 +505,19 @@ def main():
          [(AUDIO_INCLUDE_OLD, AUDIO_INCLUDE_NEW), (AUDIO_OPEN_OLD, AUDIO_OPEN_NEW)],
          marker=b"BachataDiag::audio_opens", note="(audio open counter)")
 
+    # 9. libc_internal -- the real fix. MUST run last: it changes what the guest links against.
+    # Note the marker: RegisterFexLibcMemoryAliases(sym); already appears in ForceRegisterLib(),
+    # so using it as the idempotency marker silently skipped this edit. Match a string that
+    # only exists after the rewrite instead.
+    edit(core / "src/core/libraries/libc_internal/libc_internal.cpp",
+         [(LIBC_REG_OLD, LIBC_REG_NEW)],
+         marker=b"// FEX paths call libc through the veneer",
+         note="(FEX libc aliases registered from RegisterLib)")
+
+    edit(core / "src/core/libraries/libc_internal/libc_internal_memory.cpp",
+         [(LIBC_MEM_ANCHOR_OLD, LIBC_MEM_ANCHOR_NEW)],
+         marker=b"bachata_fex_malloc", note="(malloc/calloc/realloc/free for libc)")
+
     # Cheap sanity pass: the strings the CI verifier greps for in the binary.
     print("--- diagnostics check ---")
     for path, needle in (
@@ -455,6 +536,12 @@ def main():
         (core / "src/core/libraries/system/systemservice.cpp", b"BachataDiag::sys_recvevent"),
         (core / "src/core/libraries/save_data/savedata.cpp", b"BachataDiag::save_mounts"),
         (core / "src/core/libraries/audio/audioout.cpp", b"BachataDiag::audio_opens"),
+        (core / "src/core/libraries/libc_internal/libc_internal.cpp",
+         b"FEX paths call libc through the veneer"),
+        (core / "src/core/libraries/libc_internal/libc_internal_memory.cpp",
+         b"bachata_fex_malloc"),
+        (core / "src/core/libraries/libc_internal/libc_internal_memory.cpp",
+         b"gQX+4GDQjpM"),
     ):
         ok = needle in path.read_bytes()
         print(f"  {'OK  ' if ok else 'MISS'} {path.relative_to(core)} :: {needle.decode()}")
