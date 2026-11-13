@@ -51,6 +51,18 @@ inline std::atomic<unsigned long long> presents{0};     // Driver::Flip -> prese
 inline std::atomic<unsigned long long> gnm_submits{0};  // sceGnmSubmitCommandBuffers*
 inline std::atomic<unsigned long long> blanks{0};       // DrawBlankFrame
 
+// Per-event counters. The vblank loop runs at 60 Hz while nothing is submitted, so ordering the
+// startup milestones -- which of them ever happen, and in what order -- is what tells a guest that
+// is waiting on something from a guest that never got there.
+inline std::atomic<unsigned long long> pad_opens{0};        // scePadOpen
+inline std::atomic<unsigned long long> sys_getstatus{0};    // sceSystemServiceGetStatus
+inline std::atomic<unsigned long long> sys_recvevent{0};    // sceSystemServiceReceiveEvent
+inline std::atomic<unsigned long long> sys_event{0};        // events actually delivered
+inline std::atomic<unsigned long long> sys_paramgetint{0};  // sceSystemServiceParamGetInt
+inline std::atomic<unsigned long long> save_mounts{0};      // save data mount attempts
+inline std::atomic<unsigned long long> audio_opens{0};      // sceAudioOutOpen
+inline std::atomic<unsigned long long> user_opens{0};       // sceUserServiceGetInitialUser etc.
+
 // The frontend captures the core's stdout in 4 KiB blocks, so a run that dies or hangs mid-flight
 // loses its tail. Line buffering keeps the last lines on disk. Must be called before anything
 // writes to stdout.
@@ -509,7 +521,7 @@ inline void StartHeartbeat() {
                 line, sizeof(line),
                 "t=%lldms rss=%ldMB peak=%ldMB vm=%ldMB thr=%ld cpu=%llu%% gmain=%llu%% "
                 "st=R%d/S%d/D%d gst=%c gw=%s gsys=%s flip=%llu pres=%llu gnm=%llu blank=%llu "
-                "enosys=%s busy=%s w=%s",
+                "ev=p%llu/s%llu/r%llu/d%llu/i%llu/m%llu/a%llu/u%llu enosys=%s busy=%s w=%s",
                 static_cast<long long>(ms), rss_kb / 1024, peak_kb / 1024, vm_kb / 1024, threads,
                 dcpu * 100 / ticks_per_period, guest_pct, scan.running, scan.sleeping, scan.disk,
                 scan.guest_found ? scan.g_state : '-',
@@ -517,8 +529,15 @@ inline void StartHeartbeat() {
                 scan.g_syscall[0] != '\0' ? scan.g_syscall : "-",
                 flips.load(std::memory_order_relaxed), presents.load(std::memory_order_relaxed),
                 gnm_submits.load(std::memory_order_relaxed),
-                blanks.load(std::memory_order_relaxed), enosys, busy[0] != '\0' ? busy : "-",
-                wchan[0] != '\0' ? wchan : "-");
+                blanks.load(std::memory_order_relaxed), pad_opens.load(std::memory_order_relaxed),
+                sys_getstatus.load(std::memory_order_relaxed),
+                sys_recvevent.load(std::memory_order_relaxed),
+                sys_event.load(std::memory_order_relaxed),
+                sys_paramgetint.load(std::memory_order_relaxed),
+                save_mounts.load(std::memory_order_relaxed),
+                audio_opens.load(std::memory_order_relaxed),
+                user_opens.load(std::memory_order_relaxed), enosys,
+                busy[0] != '\0' ? busy : "-", wchan[0] != '\0' ? wchan : "-");
             if (len < 0) {
                 continue;
             }

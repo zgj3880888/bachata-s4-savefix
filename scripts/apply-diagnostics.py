@@ -255,6 +255,118 @@ public:
 };
 """
 
+# ---------------------------------------------------------------------------------------------
+# 7. startup milestone counters
+#
+# The vblank loop keeps drawing blank frames at 60 Hz while the guest never submits, so the log
+# cannot be ordered against wall time. Counting the milestones tells which of them the guest ever
+# reached, and the heartbeat can then say whether it is blocked waiting for one of them.
+# ---------------------------------------------------------------------------------------------
+PAD_INCLUDE_OLD = b"""#include "common/elf_info.h"
+#include "common/logging/log.h"
+#include "common/singleton.h"
+"""
+
+PAD_INCLUDE_NEW = b"""#include "common/bachata_diag.h"
+#include "common/elf_info.h"
+#include "common/logging/log.h"
+#include "common/singleton.h"
+"""
+
+PAD_OPEN_OLD = b"""int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
+                            s32 index, const OrbisPadOpenParam* pParam) {
+    if (!g_initialized) {
+"""
+
+PAD_OPEN_NEW = b"""int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
+                            s32 index, const OrbisPadOpenParam* pParam) {
+    // A game with no pad handle yet never reports input to its main loop.
+    BachataDiag::pad_opens.fetch_add(1, std::memory_order_relaxed);
+    if (!g_initialized) {
+"""
+
+SYS_INCLUDE_OLD = b"""#include "common/elf_info.h"
+#include "common/singleton.h"
+"""
+
+SYS_INCLUDE_NEW = b"""#include "common/bachata_diag.h"
+#include "common/elf_info.h"
+#include "common/singleton.h"
+"""
+
+SYS_STATUS_OLD = b"""s32 PS4_SYSV_ABI sceSystemServiceGetStatus(OrbisSystemServiceStatus* status) {
+    LOG_TRACE(Lib_SystemService, "called");
+"""
+
+SYS_STATUS_NEW = b"""s32 PS4_SYSV_ABI sceSystemServiceGetStatus(OrbisSystemServiceStatus* status) {
+    BachataDiag::sys_getstatus.fetch_add(1, std::memory_order_relaxed);
+    LOG_TRACE(Lib_SystemService, "called");
+"""
+
+SYS_RECV_OLD = b"""s32 PS4_SYSV_ABI sceSystemServiceReceiveEvent(OrbisSystemServiceEvent* event) {
+    LOG_TRACE(Lib_SystemService, "called");
+"""
+
+SYS_RECV_NEW = b"""s32 PS4_SYSV_ABI sceSystemServiceReceiveEvent(OrbisSystemServiceEvent* event) {
+    // Polled in a loop by startup code that waits for the system to report readiness.
+    BachataDiag::sys_recvevent.fetch_add(1, std::memory_order_relaxed);
+    LOG_TRACE(Lib_SystemService, "called");
+"""
+
+SYS_EVENT_OLD = b"""    *event = g_event_queue.front();
+    g_event_queue.pop();
+"""
+
+SYS_EVENT_NEW = b"""    BachataDiag::sys_event.fetch_add(1, std::memory_order_relaxed);
+    *event = g_event_queue.front();
+    g_event_queue.pop();
+"""
+
+SYS_PARAM_OLD = b"""    LOG_DEBUG(Lib_SystemService, "called param_id {}", u32(param_id));
+"""
+
+SYS_PARAM_NEW = b"""    BachataDiag::sys_paramgetint.fetch_add(1, std::memory_order_relaxed);
+    LOG_DEBUG(Lib_SystemService, "called param_id {}", u32(param_id));
+"""
+
+SAVE_INCLUDE_OLD = b"""#include "common/assert.h"
+#include "common/cstring.h"
+"""
+
+SAVE_INCLUDE_NEW = b"""#include "common/assert.h"
+#include "common/bachata_diag.h"
+#include "common/cstring.h"
+"""
+
+SAVE_MOUNT_OLD = b"""Error PS4_SYSV_ABI sceSaveDataMount(const OrbisSaveDataMount* mount,
+                                    OrbisSaveDataMountResult* mount_result) {
+    if (!g_initialized) {
+"""
+
+SAVE_MOUNT_NEW = b"""Error PS4_SYSV_ABI sceSaveDataMount(const OrbisSaveDataMount* mount,
+                                    OrbisSaveDataMountResult* mount_result) {
+    BachataDiag::save_mounts.fetch_add(1, std::memory_order_relaxed);
+    if (!g_initialized) {
+"""
+
+AUDIO_INCLUDE_OLD = b"""#include <fmt/format.h>
+#include <magic_enum/magic_enum.hpp>
+"""
+
+AUDIO_INCLUDE_NEW = b"""#include <fmt/format.h>
+#include <magic_enum/magic_enum.hpp>
+#include "common/bachata_diag.h"
+"""
+
+AUDIO_OPEN_OLD = b"""                                 OrbisAudioOutParamExtendedInformation param_type) {
+    LOG_INFO(Lib_AudioOut,
+"""
+
+AUDIO_OPEN_NEW = b"""                                 OrbisAudioOutParamExtendedInformation param_type) {
+    BachataDiag::audio_opens.fetch_add(1, std::memory_order_relaxed);
+    LOG_INFO(Lib_AudioOut,
+"""
+
 
 def main():
     if len(sys.argv) != 2:
@@ -306,10 +418,30 @@ def main():
          [(HCA_INCLUDE_OLD, HCA_INCLUDE_NEW), (HCA_INVOKE_OLD, HCA_INVOKE_NEW)],
          marker=b"BachataDiag::NoteUnresolvedCall", note="(unimplemented HLE call counter)")
 
+    # 8. startup milestones
+    edit(core / "src/core/libraries/pad/pad.cpp",
+         [(PAD_INCLUDE_OLD, PAD_INCLUDE_NEW), (PAD_OPEN_OLD, PAD_OPEN_NEW)],
+         marker=b"BachataDiag::pad_opens", note="(pad open counter)")
+
+    edit(core / "src/core/libraries/system/systemservice.cpp",
+         [(SYS_INCLUDE_OLD, SYS_INCLUDE_NEW), (SYS_STATUS_OLD, SYS_STATUS_NEW),
+          (SYS_RECV_OLD, SYS_RECV_NEW), (SYS_EVENT_OLD, SYS_EVENT_NEW),
+          (SYS_PARAM_OLD, SYS_PARAM_NEW)],
+         marker=b"BachataDiag::sys_getstatus", note="(system service poll counters)")
+
+    edit(core / "src/core/libraries/save_data/savedata.cpp",
+         [(SAVE_INCLUDE_OLD, SAVE_INCLUDE_NEW), (SAVE_MOUNT_OLD, SAVE_MOUNT_NEW)],
+         marker=b"BachataDiag::save_mounts", note="(save mount counter)")
+
+    edit(core / "src/core/libraries/audio/audioout.cpp",
+         [(AUDIO_INCLUDE_OLD, AUDIO_INCLUDE_NEW), (AUDIO_OPEN_OLD, AUDIO_OPEN_NEW)],
+         marker=b"BachataDiag::audio_opens", note="(audio open counter)")
+
     # Cheap sanity pass: the strings the CI verifier greps for in the binary.
     print("--- diagnostics check ---")
     for path, needle in (
         (core / "src/common/bachata_diag.h", b"bachata-heartbeat.txt"),
+        (core / "src/common/bachata_diag.h", b"ev=p%llu"),
         (core / "src/main.cpp", b"BachataDiag::StartHeartbeat"),
         (core / "src/main.cpp", b"BachataDiag::UnbufferLogs"),
         (core / "src/core/libraries/libs.cpp",
@@ -319,6 +451,10 @@ def main():
         (core / "src/core/libraries/videoout/driver.cpp", b"BachataDiag::presents"),
         (core / "src/core/libraries/gnmdriver/gnmdriver.cpp", b"BachataDiag::gnm_submits"),
         (core / "src/core/guest_cpu/hle_call_adapter.h", b"BachataDiag::NoteUnresolvedCall"),
+        (core / "src/core/libraries/pad/pad.cpp", b"BachataDiag::pad_opens"),
+        (core / "src/core/libraries/system/systemservice.cpp", b"BachataDiag::sys_recvevent"),
+        (core / "src/core/libraries/save_data/savedata.cpp", b"BachataDiag::save_mounts"),
+        (core / "src/core/libraries/audio/audioout.cpp", b"BachataDiag::audio_opens"),
     ):
         ok = needle in path.read_bytes()
         print(f"  {'OK  ' if ok else 'MISS'} {path.relative_to(core)} :: {needle.decode()}")
