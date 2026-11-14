@@ -423,7 +423,7 @@ jobs:
           # only the port. Without these the next round of logs would again be unreadable.
           for s in 'bachata-heartbeat.txt' 'libSceNgs2.sprx is pre-registered at startup' \
                    '[bachata-diag] heartbeat armed' 'gmain=' 'busy=' 'gsys=' 'enosys=' \
-                   'ev=p%llu'; do
+                   'ev=p%llu' 'tail='; do
             if grep -qaF -- "$s" "$bin"; then echo "OK   diag $s"; else
               echo "MISS diag $s"; fail=1; fi
           done
@@ -431,8 +431,14 @@ jobs:
           # implements four of them, which is what parked the guest at CreateStack. These are
           # the fmt literals from the two halves of the fix, so they prove both the NID-only
           # linker fallback and the host-libc forwarding actually made it into the binary.
-          for s in 'resolved via alias' 'not forwarded on this libc' \
-                   'guest comparator ABI differs'; do
+          #
+          # 'not forwarded on this libc' used to be asserted here, from host_sscanf. It is gone
+          # and must not come back: the FEX HLE bridge cannot instantiate an adapter for a C
+          # variadic signature, so host_sscanf is registered nowhere and called by nothing, and
+          # the linker drops the unreachable function together with its only string literal.
+          # Asserting a literal from dead code does not verify the fix, it verifies that dead
+          # code was kept alive -- which is exactly the ForceRegisterLib trap from r19.
+          for s in 'resolved via alias' 'guest comparator ABI differs'; do
             if grep -qaF -- "$s" "$bin"; then echo "OK   libc $s"; else
               echo "MISS libc $s"; fail=1; fi
           done
