@@ -24,6 +24,7 @@
 // ISO C / POSIX with no structure-layout surprises except `struct tm`, which is
 // converted explicitly.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -32,9 +33,11 @@
 #include <ctime>
 #include <cwchar>
 #include <thread>
+#include <vector>
 #include <sys/resource.h>
 
 #include "common/logging/log.h"
+#include "core/libraries/libc_internal/printf.h"
 #include "core/libraries/libs.h"
 
 namespace Libraries::LibcInternal {
@@ -184,55 +187,71 @@ s32 PS4_SYSV_ABI host_remove(const char* path) {
     return std::remove(path);
 }
 
-// The formatting entry points need va_list forwarding. The PS4 guest ABI uses
-// the standard SysV va_list layout, which is what the compiler produces here,
-// so a plain vfprintf forward is correct.
-s32 PS4_SYSV_ABI host_printf(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    const s32 r = std::vprintf(fmt, args);
-    va_end(args);
-    return r;
+// The formatting entry points need va_list forwarding, and the guest hands us the list the
+// x86-64 way: the variadic arguments sit in the guest's registers and stack, and a `va_list`
+// is a pointer to the guest's own __va_list_tag. common/va_ctx.h documents that layout and
+// Common::VaList is a byte-for-byte match for it.
+//
+// vsnprintf and vsprintf used to be declared `(..., va_list args)`, which cannot work twice
+// over. On AArch64 a va_list is a struct, so no adapter in the FEX bridge can describe the
+// parameter and the whole call was rejected with ENOTSUP before a line of this file ran --
+// that is the -95 the r23 dump reports for Q2V+iqvjgC0, immediately before the crash. And even
+// if it could be described, an AArch64 va_list is not what the guest passed: the guest passed
+// a pointer.
+//
+// So take the pointer and walk it with the project's own formatter. _vsnprintf() hard-codes
+// its output limit to SIZE_MAX, so the bound has to be enforced here: measure with a discarded
+// pass over a copy of the list, format into scratch, then copy at most n-1 bytes out.
+constexpr size_t kSprintfCap = 8192;
+
+s32 FormatGuestList(Common::VaList* args, const char* fmt, char* out, size_t n) {
+    // A null list cannot be walked: _vsnprintf would follow a null reg_save_area. Report it as a
+    // failed call instead of faulting on the guest's behalf.
+    if (fmt == nullptr || args == nullptr) {
+        if (out != nullptr && n > 0) {
+            out[0] = '\0';
+        }
+        return -1;
+    }
+    Common::VaList measure = *args; // walking advances the two offsets only, never the save areas
+    const int needed = _vsnprintf(_out_buffer, nullptr, fmt, &measure);
+    if (needed < 0) {
+        if (out != nullptr && n > 0) {
+            out[0] = '\0';
+        }
+        return needed;
+    }
+    std::vector<char> scratch(static_cast<size_t>(needed) + 1, '\0');
+    Common::VaList replay = *args;
+    _vsnprintf(_out_buffer, scratch.data(), fmt, &replay);
+    if (out != nullptr && n > 0) {
+        const size_t copy = std::min(static_cast<size_t>(needed), n - 1);
+        std::memcpy(out, scratch.data(), copy);
+        out[copy] = '\0';
+    }
+    return needed;
 }
 
+s32 PS4_SYSV_ABI host_vsnprintf(char* buf, size_t n, const char* fmt, Common::VaList* args) {
+    return FormatGuestList(args, fmt, buf, n);
+}
+
+s32 PS4_SYSV_ABI host_vsprintf(char* buf, const char* fmt, Common::VaList* args) {
+    // sprintf carries no bound of its own. Cap it instead of trusting the guest's buffer:
+    // a truncated string is recoverable, a smashed stack is not.
+    return FormatGuestList(args, fmt, buf, kSprintfCap);
+}
+
+// vprintf/vfprintf keep the signature they had: their stream argument is an OrbisFILE*, not a
+// host FILE*, and nothing has shown this title calling either one. They still fail with ENOTSUP
+// if they ever are, which is the honest answer, and strictly better than writing through an
+// object that is not a host stream.
 s32 PS4_SYSV_ABI host_vprintf(const char* fmt, va_list args) {
     return std::vprintf(fmt, args);
 }
 
-s32 PS4_SYSV_ABI host_fprintf(void* stream, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    const s32 r = std::vfprintf(static_cast<FILE*>(stream), fmt, args);
-    va_end(args);
-    return r;
-}
-
 s32 PS4_SYSV_ABI host_vfprintf(void* stream, const char* fmt, va_list args) {
     return std::vfprintf(static_cast<FILE*>(stream), fmt, args);
-}
-
-s32 PS4_SYSV_ABI host_sprintf(char* buf, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    const s32 r = std::vsprintf(buf, fmt, args);
-    va_end(args);
-    return r;
-}
-
-s32 PS4_SYSV_ABI host_snprintf(char* buf, size_t n, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    const s32 r = std::vsnprintf(buf, n, fmt, args);
-    va_end(args);
-    return r;
-}
-
-s32 PS4_SYSV_ABI host_vsnprintf(char* buf, size_t n, const char* fmt, va_list args) {
-    return std::vsnprintf(buf, n, fmt, args);
-}
-
-s32 PS4_SYSV_ABI host_vsprintf(char* buf, const char* fmt, va_list args) {
-    return std::vsprintf(buf, fmt, args);
 }
 
 s32 PS4_SYSV_ABI host_sscanf(const char* str, const char* fmt, ...) {

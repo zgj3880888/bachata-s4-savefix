@@ -293,6 +293,124 @@ HCA_TYPED_NEW = b"""    HleCallResult Invoke(HleCallFrame& frame) const override
 """
 
 # ---------------------------------------------------------------------------------------------
+# 7d. let a 16-byte vector argument cross the FEX bridge
+#
+# libSceLibcInternal's snprintf is declared as (char*, u64, VA_ARGS), and common/va_ctx.h expands
+# VA_ARGS into the x86-64 argument registers spelled out one by one: rdi,rsi,rdx,rcx,r8,r9,
+# overflow_arg_area, then eight __m128. Off x86, __m128 is a typedef for __int128.
+#
+# Those eight are therefore 16 bytes wide. Nothing in this adapter describes a 16-byte argument, so
+# every predicate below evaluated false, the if constexpr in Invoke() compiled the ENOTSUP branch in
+# permanently, and *every* call to a function that spells its varargs out this way returned -95
+# without formatting a single byte. The r23 diagnostic dump shows exactly two such calls in a 1.8
+# second run, and the second one is the last thing that happened before the access violation:
+#
+#   snprintf   libSceLibcInternal  eLdDw6l0-bU   failed: 95
+#   vsnprintf  libc                Q2V+iqvjgC0   failed: 95
+#
+# The general-purpose half of that parameter list already decodes correctly: CallCursor walks
+# rdi,rsi,rdx,rcx,r8,r9 and then the guest stack, which is exactly what the compiler would have
+# loaded into the callee's rdi..r9. Only the xmm half was missing. Adding it makes the whole
+# printf family work through the existing va_ctx.h machinery instead of reinventing formatting.
+HCA_WIDE_OLD = b"""template <typename T>
+inline constexpr bool IsSupportedArgument = FitsIntegerRegister<T> || IsVectorArgument<T>;
+"""
+
+HCA_WIDE_NEW = b"""// Bachata: __m128 is __int128 off x86 (see common/va_ctx.h), so a vector argument that wide
+// arrives in one xmm register holding both halves. Without this, every function that spells its
+// varargs out as parameters -- the whole printf family -- fails with ENOTSUP on every call.
+template <typename T>
+inline constexpr bool IsWideVectorArgument = [] {
+#if defined(__SIZEOF_INT128__)
+    return std::is_same_v<std::remove_cv_t<T>, __int128>;
+#else
+    return false;
+#endif
+}();
+
+template <typename T>
+inline constexpr bool IsSupportedArgument =
+    FitsIntegerRegister<T> || IsVectorArgument<T> || IsWideVectorArgument<T>;
+"""
+
+HCA_CURSOR_OLD = b"""    std::optional<u64> NextVector() {
+        if (vector_index < 8) {
+            return frame.xmm[vector_index++][0];
+        }
+        return NextStackSlot();
+    }
+"""
+
+HCA_CURSOR_NEW = b"""    std::optional<u64> NextVector() {
+        if (vector_index < 8) {
+            return frame.xmm[vector_index++][0];
+        }
+        return NextStackSlot();
+    }
+
+    // A 16-byte vector argument occupies a whole xmm register: low half first, then high half.
+    std::optional<std::array<u64, 2>> NextVectorWide() {
+        if (vector_index < 8) {
+            return frame.xmm[vector_index++];
+        }
+        return std::nullopt;
+    }
+"""
+
+HCA_DECODE_OLD = b"""std::optional<T> DecodeArgument(CallCursor& cursor) {
+    if constexpr (IsVectorArgument<T>) {
+"""
+
+HCA_DECODE_NEW = b"""std::optional<T> DecodeArgument(CallCursor& cursor) {
+    if constexpr (IsWideVectorArgument<T>) {
+        const auto value = cursor.NextVectorWide();
+        if (!value) return std::nullopt;
+        T result{};
+        std::memcpy(&result, value->data(), sizeof(result));
+        return result;
+    } else if constexpr (IsVectorArgument<T>) {
+"""
+
+# ---------------------------------------------------------------------------------------------
+# 7e. print the HLE call ring when the guest dies
+#
+# The heartbeat samples every five seconds. This title now reaches its access violation 1.8 seconds
+# in, so the r23 report carried no heartbeat at all and therefore no "tail=" field: the one piece of
+# information that says which calls the guest was making when it died. The ring already exists; it
+# just needs to be drained on the fatal path as well.
+SIG_INCLUDE_OLD = b"""#include <fmt/format.h>
+#include "common/arch.h"
+"""
+
+SIG_INCLUDE_NEW = b"""#include <fmt/format.h>
+#include "common/arch.h"
+#include "common/bachata_diag.h"
+"""
+
+SIG_TAIL_OLD = b"""            if (::Core::Fex::BachataQueryGuestRipSyscall(&guest_rip, &guest_rax)) {
+                LOG_CRITICAL(Debug, "FEX guest state at fault: rip={:#x} rax={:#x}", guest_rip,
+                             guest_rax);
+            }
+#endif
+"""
+
+SIG_TAIL_NEW = b"""            if (::Core::Fex::BachataQueryGuestRipSyscall(&guest_rip, &guest_rax)) {
+                LOG_CRITICAL(Debug, "FEX guest state at fault: rip={:#x} rax={:#x}", guest_rip,
+                             guest_rax);
+            }
+            {
+                // Bachata: drain the last-N HLE call ring here too, because a run that dies
+                // faster than one heartbeat period otherwise reports nothing at all. This has
+                // to stay inside the FEX guard: without it bachata_diag.h has no detail::
+                // namespace at all, only the no-op stubs.
+                char hle_tail[640];
+                BachataDiag::detail::FormatCallTail(hle_tail, static_cast<int>(sizeof(hle_tail)));
+                LOG_CRITICAL(Debug, "HLE call tail at fault: {}", hle_tail);
+            }
+#endif
+"""
+
+# ---------------------------------------------------------------------------------------------
 # 7c. flush the log file after every message
 #
 # LogFileSink writes through spdlog::details::file_helper_, i.e. a fully buffered stdio stream.
@@ -788,6 +906,17 @@ def main():
          marker=b"Bachata: file_helper_ is a fully buffered stdio stream",
          note="(log file flushed per message)")
 
+    # 7d. 16-byte vector arguments: what actually makes the printf family work
+    edit(core / "src/core/guest_cpu/hle_call_adapter.h",
+         [(HCA_WIDE_OLD, HCA_WIDE_NEW), (HCA_CURSOR_OLD, HCA_CURSOR_NEW),
+          (HCA_DECODE_OLD, HCA_DECODE_NEW)],
+         marker=b"Bachata: __m128 is __int128 off x86", note="(16-byte vector arguments)")
+
+    # 7e. drain the HLE call ring on the fatal path
+    edit(core / "src/core/signals.cpp",
+         [(SIG_INCLUDE_OLD, SIG_INCLUDE_NEW), (SIG_TAIL_OLD, SIG_TAIL_NEW)],
+         marker=b"Bachata: drain the last-N HLE call ring", note="(HLE call tail at fault)")
+
     # 8. startup milestones
     edit(core / "src/core/libraries/pad/pad.cpp",
          [(PAD_INCLUDE_OLD, PAD_INCLUDE_NEW), (PAD_OPEN_OLD, PAD_OPEN_NEW)],
@@ -859,6 +988,9 @@ def main():
         (core / "src/core/libraries/gnmdriver/gnmdriver.cpp", b"BachataDiag::gnm_submits"),
         (core / "src/core/guest_cpu/hle_call_adapter.h", b"BachataDiag::NoteUnresolvedCall"),
         (core / "src/core/guest_cpu/hle_call_adapter.h", b"BachataDiag::NoteHleCall"),
+        (core / "src/core/guest_cpu/hle_call_adapter.h", b"IsWideVectorArgument"),
+        (core / "src/core/guest_cpu/hle_call_adapter.h", b"NextVectorWide"),
+        (core / "src/core/signals.cpp", b"HLE call tail at fault"),
         (core / "src/common/logging/log_file_sink.h",
          b"Bachata: file_helper_ is a fully buffered stdio stream"),
         (core / "src/common/bachata_diag.h", b"FormatCallTail"),
