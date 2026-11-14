@@ -44,6 +44,7 @@ Usage: scripts/apply-diagnostics.py <core-dir>
 """
 
 import pathlib
+import re
 import sys
 
 MARK = b"BachataDiag::"
@@ -486,21 +487,18 @@ RESOLVER_CPP_NEW = b"""    // LOG_INFO(Core_Linker, "Unresolved! {}", name);
 
 const SymbolRecord* SymbolsResolver::FindSymbolByNid(std::string_view nid,
                                                      SymbolType type) const {
-    // SymbolRecord::name is GenerateName(s) == "NID#library#version#module#type", so the NID
-    // is a fixed prefix and the symbol type is a fixed suffix. Comparing those two ends is
-    // exactly "same NID and same type, any library/module/version".
+    // Same walk as FindSymbol, with library / version / module deliberately dropped.
     //
-    // Linear on purpose: this only runs after the exact-match lookup has already missed, i.e.
-    // once per unresolved import during relocation, not per guest call.
-    const std::string_view suffix = SymbolTypeToS(type);
+    // The NID is sha1(symbol name + salt), so it identifies the function itself, not the
+    // library that happens to announce it. libc.prx re-exports a large slice of what
+    // libSceLibcInternal already implements, only under ("libc", "libc") instead of
+    // ("libSceLibcInternal", "libSceLibcInternal"); a game importing strlen from libc
+    // therefore misses an implementation shadPS4 already has, and gets an ENOSYS stub.
+    //
+    // Linear on purpose: this only runs after the exact-match lookup has already missed,
+    // i.e. once per unresolved import during relocation, not per guest call.
     for (const auto& record : m_symbols) {
-        if (record.name.size() <= nid.size() || record.name[nid.size()] != '#' ||
-            record.name.compare(0, nid.size(), nid.data(), nid.size()) != 0) {
-            continue;
-        }
-        const auto tail = record.name.size() - suffix.size();
-        if (record.name.size() <= suffix.size() ||
-            record.name.compare(tail, suffix.size(), suffix.data(), suffix.size()) != 0) {
+        if (record.symbol.type != type || record.symbol.name != nid) {
             continue;
         }
 #ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
@@ -539,7 +537,7 @@ LINKER_ALIAS_NEW = b"""        *return_info = *record;
     const auto* alias = m_hle_symbols.FindSymbolByNid(sr.name, sym_type);
     if (alias != nullptr) {
         LOG_INFO(Core_Linker, "NID {} resolved via alias {} (wanted {}#{}#{})", sr.name,
-                 alias->name, sr.library, sr.library_version, sr.module);
+                 alias->symbol.name, sr.library, sr.library_version, sr.module);
         *return_info = *alias;
         Core::Devtools::Widget::ModuleList::AddModule(sr.library);
         return true;
@@ -815,7 +813,7 @@ def main():
         (core / "src/core/libraries/libc_internal/libc_internal.cpp",
          b"RegisterFexLibcHostAliases"),
         (core / "src/core/libraries/libc_internal/libc_internal_host.cpp", b"host_qsort"),
-        (core / "src/core/libraries/libc_internal/libc_internal_host.cpp", b"hcuQgD53UxM"),
+        (core / "src/core/libraries/libc_internal/libc_internal_host.cpp", b"GMpvxPFW924"),
     ):
         ok = needle in path.read_bytes()
         print(f"  {'OK  ' if ok else 'MISS'} {path.relative_to(core)} :: {needle.decode()}")
@@ -833,6 +831,29 @@ def main():
     print(f"  {'OK  ' if placed else 'MISS'} libc_internal.cpp :: host aliases inside "
           f"RegisterLib (not ForceRegisterLib)")
     if not placed:
+        sys.exit(1)
+
+    # Second structural check: no LIB_FUNCTION() may take a C-variadic function.
+    #
+    # The FEX bridge instantiates TypedHleCallAdapter<Return (*)(Args...)> per registration, and
+    # an ellipsis never matches that partial specialisation -- the primary template stays
+    # undefined and clang reports "implicit instantiation of undefined template". It is a compile
+    # error, not a runtime limitation, so it would fail the whole build (this is exactly how the
+    # printf/fprintf/sprintf/sscanf registrations broke the first r21 build). Only the va_list
+    # twins may be registered.
+    host_src = (core / "src/core/libraries/libc_internal/libc_internal_host.cpp").read_text(
+        encoding="utf-8", errors="replace")
+    registered = re.findall(
+        r'LIB_FUNCTION\("[^"]+",\s*"[^"]+",\s*\d+,\s*"[^"]+",\s*(\w+)\)', host_src)
+    param_lists = {}
+    for m in re.finditer(r'\b(\w+)\s*\(([^;{}]*?)\)\s*\{', host_src):
+        param_lists.setdefault(m.group(1), []).append(m.group(2))
+    variadic = [fn for fn in registered
+                if any("..." in p for p in param_lists.get(fn, []))]
+    print(f"  {'OK  ' if not variadic else 'MISS'} libc_internal_host.cpp :: "
+          f"{len(registered)} registrations, none C-variadic"
+          + (f" (offenders: {', '.join(variadic)})" if variadic else ""))
+    if variadic:
         sys.exit(1)
 
 

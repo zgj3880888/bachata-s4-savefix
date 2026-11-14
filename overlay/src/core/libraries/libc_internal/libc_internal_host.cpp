@@ -384,14 +384,21 @@ void RegisterFexLibcHostAliases(Core::Loader::SymbolsResolver* sym) {
     // registrar -- not this file -- is the thing to look at.
 
     // Formatted output
-    LIB_FUNCTION("hcuQgD53UxM", "libc", 1, "libc", host_printf);
+    //
+    // NOT registered here: printf / fprintf / sprintf / sscanf. The FEX HLE bridge creates one
+    // typed adapter per signature (TypedHleCallAdapter<Return (*)(Args...)>), and a C variadic
+    // ellipsis does not match that template, so LIB_FUNCTION() on any of them is a hard compile
+    // error rather than a runtime limitation -- the instantiation is left undefined and clang
+    // rejects the TU. The va_list twins below have concrete parameter lists and do compile; they
+    // read the guest's argument registers through the same SysV va_list layout used here.
+    //
+    // Leaving the ellipsis family unregistered is also the safer behaviour: an import that
+    // reaches the linker for one of them gets the ordinary ENOSYS stub, whereas a shim that
+    // silently dropped the format arguments would hand the guest a plausible-looking result.
     LIB_FUNCTION("GMpvxPFW924", "libc", 1, "libc", host_vprintf);
-    LIB_FUNCTION("fffwELXNVFA", "libc", 1, "libc", host_fprintf);
     LIB_FUNCTION("pDBDcY6uLSA", "libc", 1, "libc", host_vfprintf);
-    LIB_FUNCTION("tcVi5SivF7Q", "libc", 1, "libc", host_sprintf);
     LIB_FUNCTION("jbz9I9vkqkk", "libc", 1, "libc", host_vsprintf);
     LIB_FUNCTION("Q2V+iqvjgC0", "libc", 1, "libc", host_vsnprintf);
-    LIB_FUNCTION("1Pk0qZQGeWo", "libc", 1, "libc", host_sscanf);
     LIB_FUNCTION("YQ0navp+YIc", "libc", 1, "libc", host_puts);
 
     // stdio
