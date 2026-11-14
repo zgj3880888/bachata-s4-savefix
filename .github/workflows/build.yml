@@ -427,6 +427,15 @@ jobs:
             if grep -qaF -- "$s" "$bin"; then echo "OK   diag $s"; else
               echo "MISS diag $s"; fail=1; fi
           done
+          # The libc.prx fix. libc.prx exports 1448 symbols as "libc"#1#"libc" and shadPS4
+          # implements four of them, which is what parked the guest at CreateStack. These are
+          # the fmt literals from the two halves of the fix, so they prove both the NID-only
+          # linker fallback and the host-libc forwarding actually made it into the binary.
+          for s in 'resolved via alias' 'not forwarded on this libc' \
+                   'guest comparator ABI differs'; do
+            if grep -qaF -- "$s" "$bin"; then echo "OK   libc $s"; else
+              echo "MISS libc $s"; fail=1; fi
+          done
           [ "$fail" -eq 0 ] || { echo "core does not match expectations"; exit 1; }
 
       - name: Stage named artifact

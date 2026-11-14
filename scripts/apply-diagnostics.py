@@ -30,6 +30,15 @@ Edits, all idempotent:
 6. src/core/libraries/gnmdriver/gnmdriver.cpp -- command buffer submit counter.
 7. src/core/guest_cpu/hle_call_adapter.h -- count calls into UnsupportedHleCallAdapter, which is
    the shared stub behind every "unresolved HLE ... temporary ENOSYS fallback".
+8. Startup milestones: pad open, system service polls, save mount, audio open.
+9. libc_internal -- register the FEX "libc" aliases from RegisterLib (nothing called
+   ForceRegisterLib), and give malloc/calloc/realloc/free real implementations.
+10. The libc.prx fix proper. libc.prx is a SELF container that exports 1448 symbols as
+   "libc"#1#"libc", of which shadPS4 implements four. Two things: Linker::Resolve now retries
+   by NID alone (same NID + same type == same function), recovering ~71 symbols that already
+   exist under libSceLibcInternal/libSceFios2/libSceAvPlayer/libSceRtc; and libc_internal_host.cpp
+   forwards the plain C entry points shadPS4 never implemented (printf, stdio, time, qsort)
+   to the host C library. ~111 of the 245 remaining keys.
 
 Usage: scripts/apply-diagnostics.py <core-dir>
 """
@@ -39,9 +48,6 @@ import sys
 
 MARK = b"BachataDiag::"
 
-HEADER_SRC = pathlib.Path(__file__).resolve().parent.parent / "overlay/src/common/bachata_diag.h"
-HEADER_DST = "src/common/bachata_diag.h"
-
 
 def read(path):
     p = pathlib.Path(path)
@@ -50,12 +56,22 @@ def read(path):
     return p
 
 
-def edit(path, pairs, marker=None, note=""):
-    """Apply (old, new) byte pairs to `path`, tolerating either line ending."""
+def edit(path, pairs, marker=None, note="", already_marker=None):
+    """Apply (old, new) byte pairs to `path`, tolerating either line ending.
+
+    `marker` is the text that only exists *after* this edit; seeing it means "already done".
+    `already_marker` is the same idea for a change an earlier build may have made. Groups 9
+    and 10 both write into RegisterLib(), so on a tree that was patched before, group 9's own
+    marker can be absent while its intent is already satisfied. Treating that as a hard error
+    would make group 10 unreachable, so those callers pass `already_marker` too.
+    """
     p = read(path)
     data = p.read_bytes()
     if marker is not None and marker in data:
         print(f"already applied {path} {note}")
+        return
+    if already_marker is not None and already_marker in data:
+        print(f"already applied {path} {note} (superseded by later group)")
         return
     for old, new in pairs:
         hit = None
@@ -384,12 +400,16 @@ AUDIO_OPEN_NEW = b"""                                 OrbisAudioOutParamExtended
 # any guest module is relocated), and give malloc/calloc/realloc/free real implementations.
 # ---------------------------------------------------------------------------------------------
 
-LIBC_REG_OLD = b"""    RegisterlibSceLibcInternalIo(sym);
-    RegisterlibSceLibcInternalThreads(sym);
-}"""
+# The upstream tree at CORE_REF already carries the alias registration in RegisterLib(), so
+# there are two live shapes for group 9 to handle:
+#   (a) RegisterLib ends right after Threads(sym);          -> the original 2026-11-13 form
+#   (b) RegisterLib already has the #ifdef FEX alias block  -> ups-full as of the r21 rebase
+# Both are anchored on the Threads() line so ForceRegisterLib() (which lacks it) can never match.
+LIBC_REG_OLD = b"""    RegisterlibSceLibcInternalThreads(sym);
+}
+"""
 
-LIBC_REG_NEW = b"""    RegisterlibSceLibcInternalIo(sym);
-    RegisterlibSceLibcInternalThreads(sym);
+LIBC_REG_NEW = b"""    RegisterlibSceLibcInternalThreads(sym);
 #ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
     // FEX paths call libc through the veneer, so the "libc" aliases have to be registered
     // explicitly. They used to be reachable only via ForceRegisterLib(), which nothing called.
@@ -398,7 +418,38 @@ LIBC_REG_NEW = b"""    RegisterlibSceLibcInternalIo(sym);
     RegisterFexLibcStrAliases(sym);
     RegisterFexLibcCxaAliases(sym);
 #endif
-}"""
+}
+"""
+
+# Shape (b): ups-full at CORE_REF. These are the exact bytes in that tree.
+LIBC_REG_UPS_OLD = b"""    RegisterlibSceLibcInternalThreads(sym);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    // NOTE (2026-11-13): the FEX "libc" aliases were previously only reachable through
+    // ForceRegisterLib(), and nothing in the tree ever called it -- grep showed the only
+    // caller of the LibcInternal registration entry points was linker.cpp:489 calling
+    // RegisterLib(). Consequence: malloc/free/strlen/calloc/... stayed unresolved and
+    // linker.cpp handed the guest an ENOSYS stub returning -38, which the guest then
+    // used as a pointer. Register them here, where they are guaranteed to land before
+    // any guest module is relocated.
+    RegisterFexLibcMemoryAliases(sym);
+    RegisterFexLibcMathAliases(sym);
+    RegisterFexLibcStrAliases(sym);
+    RegisterFexLibcCxaAliases(sym);
+#endif
+}
+"""
+
+LIBC_REG_UPS_NEW = b"""    RegisterlibSceLibcInternalThreads(sym);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    // FEX paths call libc through the veneer, so the "libc" aliases have to be registered
+    // explicitly. They used to be reachable only via ForceRegisterLib(), which nothing called.
+    RegisterFexLibcMemoryAliases(sym);
+    RegisterFexLibcMathAliases(sym);
+    RegisterFexLibcStrAliases(sym);
+    RegisterFexLibcCxaAliases(sym);
+#endif
+}
+"""
 
 LIBC_MEM_ANCHOR_OLD = b"""void RegisterFexLibcMemoryAliases(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("Q3VBxCXhUHs", "libc", 1, "libc", internal_memcpy);
@@ -436,21 +487,166 @@ void RegisterFexLibcMemoryAliases(Core::Loader::SymbolsResolver* sym) {
 }"""
 
 
+# ---------------------------------------------------------------------------------------------
+# 10. NID-only symbol fallback + host libc for the C runtime libc.prx re-exports
+#
+# Measured on r20 (2026-11-13): the libc alias registration above took unresolved HLE calls
+# from 753 to 703 in a 70 s run -- real but nowhere near enough, and the guest still parked
+# at stack.cpp CreateStack. Dumping libc.prx (it is a SELF container, not a bare ELF) showed
+# why: it exports 1527 symbols, 1448 of them as (library="libc", module="libc"), and of those
+# 1448 only four have an implementation in shadPS4. Meanwhile ~71 of the leftovers already
+# exist under a different key -- libSceLibcInternal, libSceFios2, libSceAvPlayer, libSceRtc --
+# because the NID is a hash of the symbol name and therefore identical across libraries.
+#
+# So a record with the same NID and the same type *is* the same function. Linker::Resolve now
+# retries by NID alone after the exact match misses, which picks all 71 up in one change.
+#
+# What that does not cover is the set shadPS4 never implemented at all (printf, the stdio
+# family, the time family, qsort). Those are plain host services, so libc_internal_host.cpp
+# forwards them to the C library. 71 + 40 = 111 of the 245 remaining keys.
+# ---------------------------------------------------------------------------------------------
+
+RESOLVER_H_OLD = b"""    const SymbolRecord* FindSymbol(const SymbolResolver& s) const;
+"""
+
+RESOLVER_H_NEW = b"""    const SymbolRecord* FindSymbol(const SymbolResolver& s) const;
+
+    // Resolve by NID alone, ignoring library / module / version.
+    //
+    // The NID is a hash of the symbol name, so two registrations carrying the same NID and
+    // the same type are literally the same function; only the (library, module) bookkeeping
+    // differs. Real firmware exposes the same implementation under several of these keys --
+    // libc.prx re-exports a large slice of libSceLibcInternal as "libc"#1#"libc" -- and games
+    // legitimately import from either. Without this fallback every such import becomes an
+    // ENOSYS stub even though a working implementation sits right next to it.
+    const SymbolRecord* FindSymbolByNid(std::string_view nid, SymbolType type) const;
+"""
+
+RESOLVER_CPP_OLD = b"""    // LOG_INFO(Core_Linker, "Unresolved! {}", name);
+    return nullptr;
+}
+"""
+
+RESOLVER_CPP_NEW = b"""    // LOG_INFO(Core_Linker, "Unresolved! {}", name);
+    return nullptr;
+}
+
+const SymbolRecord* SymbolsResolver::FindSymbolByNid(std::string_view nid,
+                                                     SymbolType type) const {
+    // Linear on purpose: this only runs after the exact-match lookup has already missed, i.e.
+    // once per unresolved import during relocation, not per guest call.
+    for (const auto& record : m_symbols) {
+        if (record.symbol.type != type || record.symbol.name != nid) {
+            continue;
+        }
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+        // Never hand out a placeholder as if it were an implementation.
+        if (record.hle_fallback) {
+            continue;
+        }
+#endif
+        return &record;
+    }
+    return nullptr;
+}
+"""
+
+LINKER_ALIAS_OLD = b"""        *return_info = *record;
+        Core::Devtools::Widget::ModuleList::AddModule(sr.library);
+        return true;
+    }
+
+    // Check if it an exported function from one of our loaded libraries
+"""
+
+LINKER_ALIAS_NEW = b"""        *return_info = *record;
+        Core::Devtools::Widget::ModuleList::AddModule(sr.library);
+        return true;
+    }
+
+    // Second chance: the same NID registered under a different (library, module) pair.
+    //
+    // libc.prx exports 1448 symbols and re-exports much of libSceLibcInternal, but announces
+    // them as "libc"#1#"libc". A game importing strlen from libc therefore misses the exact
+    // match libSceLibcInternal already provides and ends up with an ENOSYS stub, even though a
+    // working implementation exists. Same NID + same type means the same function.
+    if ((record = m_hle_symbols.FindSymbolByNid(sr.name, sym_type)) != nullptr) {
+        LOG_INFO(Core_Linker, "FEX: NID {} resolved via alias {} (wanted {}#{}#{})", sr.name,
+                 record->symbol.name, sr.library, sr.library_version, sr.module);
+        *return_info = *record;
+        Core::Devtools::Widget::ModuleList::AddModule(sr.library);
+        return true;
+    }
+
+    // Check if it an exported function from one of our loaded libraries
+"""
+
+# The explicit source list in CMakeLists.txt is not a GLOB, so a new .cpp is invisible until
+# it is named here.
+CMAKE_LIBC_OLD = b"""                 src/core/libraries/libc_internal/libc_internal_threads.cpp
+"""
+
+CMAKE_LIBC_NEW = b"""                 src/core/libraries/libc_internal/libc_internal_host.cpp
+                 src/core/libraries/libc_internal/libc_internal_host.h
+                 src/core/libraries/libc_internal/libc_internal_threads.cpp
+"""
+
+LIBC_INC_OLD = b"""#include "libc_internal_cxa.h"
+"""
+
+LIBC_INC_NEW = b"""#include "libc_internal_cxa.h"
+#include "libc_internal_host.h"
+"""
+
+# The anchor has to land inside RegisterLib(), not ForceRegisterLib() -- the latter is dead code
+# (nothing in the tree calls it), which is exactly the trap that made r19's aliases useless.
+# The one token unique to RegisterLib's tail is that it is immediately followed by the
+# ForceRegisterLib definition; ForceRegisterLib's own tail is followed by "} // namespace".
+# This holds for both the ups-full shape and the rewritten shape group 9 produces, because both
+# end with the same four alias calls.
+LIBC_HOST_REG_OLD = b"""    RegisterFexLibcCxaAliases(sym);
+#endif
+}
+
+void ForceRegisterLib(Core::Loader::SymbolsResolver* sym) {
+"""
+
+LIBC_HOST_REG_NEW = b"""    RegisterFexLibcCxaAliases(sym);
+    // Host-backed printf/stdio/time: libc.prx exports them, shadPS4 never implemented them.
+    RegisterFexLibcHostAliases(sym);
+#endif
+}
+
+void ForceRegisterLib(Core::Loader::SymbolsResolver* sym) {
+"""
+
+# Files that live in this repo's overlay and are copied into the core tree verbatim.
+OVERLAY_FILES = (
+    ("overlay/src/common/bachata_diag.h", "src/common/bachata_diag.h"),
+    ("overlay/src/core/libraries/libc_internal/libc_internal_host.cpp",
+     "src/core/libraries/libc_internal/libc_internal_host.cpp"),
+    ("overlay/src/core/libraries/libc_internal/libc_internal_host.h",
+     "src/core/libraries/libc_internal/libc_internal_host.h"),
+)
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit("usage: apply-diagnostics.py <core-dir>")
     core = pathlib.Path(sys.argv[1])
 
-    # 1. header
-    src = read(HEADER_SRC)
-    dst = core / HEADER_DST
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    payload = src.read_bytes().replace(b"\r\n", b"\n")
-    if dst.is_file() and dst.read_bytes() == payload:
-        print(f"already applied {dst} (diagnostics header)")
-    else:
-        dst.write_bytes(payload)
-        print(f"wrote {dst} ({len(payload)} bytes)")
+    # 1. files that live in this repo and are dropped into the core tree verbatim
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for rel_src, rel_dst in OVERLAY_FILES:
+        src = read(root / rel_src)
+        dst = core / rel_dst
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        payload = src.read_bytes().replace(b"\r\n", b"\n")
+        if dst.is_file() and dst.read_bytes() == payload:
+            print(f"already applied {dst} (overlay file)")
+        else:
+            dst.write_bytes(payload)
+            print(f"wrote {dst} ({len(payload)} bytes)")
 
     # 2. main.cpp
     edit(core / "src/main.cpp",
@@ -506,17 +702,50 @@ def main():
          marker=b"BachataDiag::audio_opens", note="(audio open counter)")
 
     # 9. libc_internal -- the real fix. MUST run last: it changes what the guest links against.
-    # Note the marker: RegisterFexLibcMemoryAliases(sym); already appears in ForceRegisterLib(),
-    # so using it as the idempotency marker silently skipped this edit. Match a string that
-    # only exists after the rewrite instead.
-    edit(core / "src/core/libraries/libc_internal/libc_internal.cpp",
-         [(LIBC_REG_OLD, LIBC_REG_NEW)],
-         marker=b"// FEX paths call libc through the veneer",
-         note="(FEX libc aliases registered from RegisterLib)")
+    libc_internal_cpp = core / "src/core/libraries/libc_internal/libc_internal.cpp"
+    if LIBC_REG_OLD in libc_internal_cpp.read_bytes():
+        pairs = [(LIBC_REG_OLD, LIBC_REG_NEW)]
+    else:
+        # ups-full already has an alias block in RegisterLib(); rewrite it to the canonical
+        # comment instead of bailing out.
+        pairs = [(LIBC_REG_UPS_OLD, LIBC_REG_UPS_NEW)]
+    edit(libc_internal_cpp, pairs,
+         marker=b"RegisterFexLibcHostAliases",
+         note="(FEX libc aliases registered from RegisterLib)",
+         already_marker=b"RegisterFexLibcCxaAliases")
 
+    # ups-full at CORE_REF already carries the whole group-9 memory change (fex_malloc /
+    # fex_calloc / fex_realloc / fex_free + internal_memmove + internal_memcpy_s under
+    # "libc"#1#"libc"), so this is a no-op on a current base and only does work on an older
+    # tree. Match on internal_memmove, which is the last line the r20 change added.
     edit(core / "src/core/libraries/libc_internal/libc_internal_memory.cpp",
          [(LIBC_MEM_ANCHOR_OLD, LIBC_MEM_ANCHOR_NEW)],
-         marker=b"bachata_fex_malloc", note="(malloc/calloc/realloc/free for libc)")
+         marker=b"bachata_fex_malloc",
+         note="(malloc/calloc/realloc/free for libc)",
+         already_marker=b'"libc", internal_memmove')
+
+    # 10. NID-only fallback + host libc. Also has to run after group 9: it assumes the alias
+    # registration is already in RegisterLib(), and it re-registers it plus the host set.
+    edit(core / "src/core/loader/symbols_resolver.h",
+         [(RESOLVER_H_OLD, RESOLVER_H_NEW)],
+         marker=b"FindSymbolByNid", note="(NID-only lookup declared)")
+
+    edit(core / "src/core/loader/symbols_resolver.cpp",
+         [(RESOLVER_CPP_OLD, RESOLVER_CPP_NEW)],
+         marker=b"SymbolsResolver::FindSymbolByNid", note="(NID-only lookup implemented)")
+
+    edit(core / "src/core/linker.cpp",
+         [(LINKER_ALIAS_OLD, LINKER_ALIAS_NEW)],
+         marker=b"resolved via alias", note="(linker retries by NID)")
+
+    edit(core / "CMakeLists.txt",
+         [(CMAKE_LIBC_OLD, CMAKE_LIBC_NEW)],
+         marker=b"libc_internal_host.cpp", note="(host libc added to the source list)")
+
+    edit(core / "src/core/libraries/libc_internal/libc_internal.cpp",
+         [(LIBC_INC_OLD, LIBC_INC_NEW), (LIBC_HOST_REG_OLD, LIBC_HOST_REG_NEW)],
+         marker=b"RegisterFexLibcHostAliases", note="(host libc registered from RegisterLib)",
+         already_marker=b"// Host-backed printf/stdio/time")
 
     # Cheap sanity pass: the strings the CI verifier greps for in the binary.
     print("--- diagnostics check ---")
@@ -536,17 +765,44 @@ def main():
         (core / "src/core/libraries/system/systemservice.cpp", b"BachataDiag::sys_recvevent"),
         (core / "src/core/libraries/save_data/savedata.cpp", b"BachataDiag::save_mounts"),
         (core / "src/core/libraries/audio/audioout.cpp", b"BachataDiag::audio_opens"),
+        # 9. libc aliases. Accepted in either shape: the canonical rewritten comment (r19/r20
+        # trees) or the upstream block that ups-full already carries. Both register the same
+        # four alias families, so only that is asserted, not the comment text.
         (core / "src/core/libraries/libc_internal/libc_internal.cpp",
-         b"FEX paths call libc through the veneer"),
+         b"RegisterFexLibcMemoryAliases(sym);"),
+        (core / "src/core/libraries/libc_internal/libc_internal.cpp",
+         b"RegisterFexLibcCxaAliases(sym);"),
         (core / "src/core/libraries/libc_internal/libc_internal_memory.cpp",
-         b"bachata_fex_malloc"),
+         b'LIB_FUNCTION("gQX+4GDQjpM", "libc", 1, "libc",'),
         (core / "src/core/libraries/libc_internal/libc_internal_memory.cpp",
-         b"gQX+4GDQjpM"),
+         b'LIB_FUNCTION("+P6FRGH4LfA", "libc", 1, "libc",'),
+        # 10. NID-only fallback + host libc
+        (core / "src/core/loader/symbols_resolver.h", b"FindSymbolByNid"),
+        (core / "src/core/loader/symbols_resolver.cpp", b"SymbolsResolver::FindSymbolByNid"),
+        (core / "src/core/linker.cpp", b"resolved via alias"),
+        (core / "CMakeLists.txt", b"libc_internal_host.cpp"),
+        (core / "src/core/libraries/libc_internal/libc_internal.cpp",
+         b"RegisterFexLibcHostAliases"),
+        (core / "src/core/libraries/libc_internal/libc_internal_host.cpp", b"host_qsort"),
+        (core / "src/core/libraries/libc_internal/libc_internal_host.cpp", b"hcuQgD53UxM"),
     ):
         ok = needle in path.read_bytes()
         print(f"  {'OK  ' if ok else 'MISS'} {path.relative_to(core)} :: {needle.decode()}")
         if not ok:
             sys.exit(1)
+
+    # Structural check the grep above cannot make: RegisterFexLibcHostAliases has to be in
+    # RegisterLib(), which is the one the linker actually calls. Landing it in ForceRegisterLib()
+    # would still satisfy every string check while registering nothing at runtime.
+    libc_cpp = (core / "src/core/libraries/libc_internal/libc_internal.cpp").read_bytes()
+    reg = libc_cpp.find(b"void RegisterLib(")
+    force = libc_cpp.find(b"void ForceRegisterLib(")
+    host = libc_cpp.find(b"RegisterFexLibcHostAliases(sym);")
+    placed = reg != -1 and force != -1 and host != -1 and reg < host < force
+    print(f"  {'OK  ' if placed else 'MISS'} libc_internal.cpp :: host aliases inside "
+          f"RegisterLib (not ForceRegisterLib)")
+    if not placed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
