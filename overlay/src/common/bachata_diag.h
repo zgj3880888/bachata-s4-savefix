@@ -447,8 +447,93 @@ inline int FormatUnresolved(char* out, int cap) {
 
 } // namespace detail
 
+// ---------------------------------------------------------------------------------------------
+// last-N HLE calls
+//
+// The milestone counters above are cumulative, so they cannot say where a guest that simply went
+// quiet stopped: a name missing from them may never have been called, or may have been called once
+// and abandoned. A ring of the most recent calls can, because it keeps order. When the picture
+// stays black and the ring has stopped changing between heartbeats, its last entries are the calls
+// the guest is sitting behind -- and the ring's stillness is itself the evidence that the guest is
+// no longer calling anything.
+//
+// Only the symbol pointer is stored, never the text: adapter names live in the HLE registry for the
+// whole process, so the pointer stays valid, and a hot-path store stays one atomic wide.
+// ---------------------------------------------------------------------------------------------
+namespace detail {
+
+constexpr int kCallTailSlots = 32;
+constexpr int kCallTailShown = 12;
+constexpr int kCallTailNameChars = 30;
+
+inline std::atomic<unsigned long long> g_call_tail_seq{0};
+inline std::atomic<unsigned long long> g_call_tail[kCallTailSlots];
+
+inline void NoteHleCall(std::string_view name) {
+    if (name.data() == nullptr || name.empty()) {
+        return;
+    }
+    const unsigned len = NameLen(name);
+    const unsigned long long packed =
+        (static_cast<unsigned long long>(len) << 48) |
+        (reinterpret_cast<unsigned long long>(name.data()) & kPtrMask);
+    const unsigned long long seq = g_call_tail_seq.fetch_add(1, std::memory_order_relaxed);
+    g_call_tail[seq % kCallTailSlots].store(packed, std::memory_order_relaxed);
+}
+
+// "<fn>,<fn>,..." oldest first. Only the part before the first '#' is printed: the adapter name is
+// "name#library#version#module#type", and the function alone is what identifies the subsystem while
+// still fitting a dozen of them on one heartbeat line.
+inline int FormatCallTail(char* out, int cap) {
+    out[0] = '\0';
+    if (cap <= 2) {
+        return 0;
+    }
+    const unsigned long long seq = g_call_tail_seq.load(std::memory_order_relaxed);
+    if (seq == 0) {
+        return 0;
+    }
+    const int shown = seq > static_cast<unsigned long long>(kCallTailShown)
+                          ? kCallTailShown
+                          : static_cast<int>(seq);
+    int off = 0;
+    for (int i = 0; i < shown && off < cap - 2; ++i) {
+        const unsigned long long idx =
+            (seq - static_cast<unsigned long long>(shown) + static_cast<unsigned long long>(i)) %
+            kCallTailSlots;
+        const unsigned long long packed = g_call_tail[idx].load(std::memory_order_relaxed);
+        if (packed == 0) {
+            continue;
+        }
+        const char* const sp = reinterpret_cast<const char*>(packed & kPtrMask);
+        unsigned len = static_cast<unsigned>(packed >> 48);
+        for (unsigned k = 0; k < len; ++k) {
+            if (sp[k] == '#') {
+                len = k;
+                break;
+            }
+        }
+        if (len == 0) {
+            continue;
+        }
+        if (len > static_cast<unsigned>(kCallTailNameChars)) {
+            len = static_cast<unsigned>(kCallTailNameChars);
+        }
+        const int w = std::snprintf(out + off, static_cast<size_t>(cap - off), "%s%.*s",
+                                    off > 0 ? "," : "", static_cast<int>(len), sp);
+        off = ClampAdd(off, w, cap);
+    }
+    return off;
+}
+
+} // namespace detail
+
 inline void NoteUnresolvedCall(std::string_view name) {
     detail::NoteUnresolvedCall(name);
+}
+
+inline void NoteHleCall(std::string_view name) {
+    detail::NoteHleCall(name);
 }
 
 inline void StartHeartbeat() {
@@ -515,13 +600,16 @@ inline void StartHeartbeat() {
             }
             char enosys[320];
             detail::FormatUnresolved(enosys, static_cast<int>(sizeof(enosys)));
+            char tail[420];
+            detail::FormatCallTail(tail, static_cast<int>(sizeof(tail)));
 
-            char line[1200];
+            char line[1800];
             int len = std::snprintf(
                 line, sizeof(line),
                 "t=%lldms rss=%ldMB peak=%ldMB vm=%ldMB thr=%ld cpu=%llu%% gmain=%llu%% "
                 "st=R%d/S%d/D%d gst=%c gw=%s gsys=%s flip=%llu pres=%llu gnm=%llu blank=%llu "
-                "ev=p%llu/s%llu/r%llu/d%llu/i%llu/m%llu/a%llu/u%llu enosys=%s busy=%s w=%s",
+                "ev=p%llu/s%llu/r%llu/d%llu/i%llu/m%llu/a%llu/u%llu enosys=%s tail=%s busy=%s "
+                "w=%s",
                 static_cast<long long>(ms), rss_kb / 1024, peak_kb / 1024, vm_kb / 1024, threads,
                 dcpu * 100 / ticks_per_period, guest_pct, scan.running, scan.sleeping, scan.disk,
                 scan.guest_found ? scan.g_state : '-',
@@ -537,7 +625,8 @@ inline void StartHeartbeat() {
                 save_mounts.load(std::memory_order_relaxed),
                 audio_opens.load(std::memory_order_relaxed),
                 user_opens.load(std::memory_order_relaxed), enosys,
-                busy[0] != '\0' ? busy : "-", wchan[0] != '\0' ? wchan : "-");
+                tail[0] != '\0' ? tail : "-", busy[0] != '\0' ? busy : "-",
+                wchan[0] != '\0' ? wchan : "-");
             if (len < 0) {
                 continue;
             }
@@ -554,6 +643,8 @@ inline void StartHeartbeat() {
 #else
 
 inline void NoteUnresolvedCall(std::string_view) {}
+
+inline void NoteHleCall(std::string_view) {}
 
 inline void StartHeartbeat() {}
 

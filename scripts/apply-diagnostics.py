@@ -273,6 +273,59 @@ public:
 """
 
 # ---------------------------------------------------------------------------------------------
+# 7b. call tail -- the last N HLE calls, in order
+#
+# The milestone counters are cumulative and unordered, so they cannot say where a guest that went
+# quiet stopped. This records every HLE call through the typed adapter (i.e. every *implemented*
+# function, not just the unresolved ones) into a 32-slot ring, which the heartbeat prints. A ring
+# that has stopped changing between two heartbeats means the guest is no longer entering HLE at
+# all, and its last entries name the call it is sitting behind.
+# ---------------------------------------------------------------------------------------------
+HCA_TYPED_OLD = b"""    HleCallResult Invoke(HleCallFrame& frame) const override {
+        if constexpr ((!IsSupportedArgument<Args> || ...) || !IsSupportedReturn<Return>) {
+"""
+
+HCA_TYPED_NEW = b"""    HleCallResult Invoke(HleCallFrame& frame) const override {
+        // Bachata: one relaxed store plus a counter, so recording every implemented HLE call is
+        // cheap enough to leave on. See BachataDiag::NoteHleCall.
+        BachataDiag::NoteHleCall(Name());
+        if constexpr ((!IsSupportedArgument<Args> || ...) || !IsSupportedReturn<Return>) {
+"""
+
+# ---------------------------------------------------------------------------------------------
+# 7c. flush the log file after every message
+#
+# LogFileSink writes through spdlog::details::file_helper_, i.e. a fully buffered stdio stream.
+# Two runs in a row ended at a size that was an exact multiple of 4096 and cut mid-line: the on-disk
+# prefix is everything stdio had already pushed out, and the interesting tail -- what the core was
+# doing when the log was pulled -- never left the buffer. UnbufferLogs() does not help, because it
+# only touches stdout/stderr, not this stream.
+# ---------------------------------------------------------------------------------------------
+LOGSINK_OLD = b"""        if (session_file_helper_.filename().empty()) {
+            // always log in the main file, it shouldnt be too big
+            main_file_helper_.write(formatted);
+        } else if (_current_size < _size_limit || msg.log_level == spdlog::level::critical) {
+            session_file_helper_.write(formatted);
+            _current_size += formatted.size();
+        }
+"""
+
+LOGSINK_NEW = b"""        if (session_file_helper_.filename().empty()) {
+            // always log in the main file, it shouldnt be too big
+            main_file_helper_.write(formatted);
+            main_file_helper_.flush();
+        } else if (_current_size < _size_limit || msg.log_level == spdlog::level::critical) {
+            session_file_helper_.write(formatted);
+            _current_size += formatted.size();
+            // Bachata: file_helper_ is a fully buffered stdio stream, so whatever is still in the
+            // buffer never reaches disk if the run is killed -- or if the log is simply pulled
+            // while the core is still alive, which is what happened to the last two runs. Flushing
+            // per message costs one syscall per line and keeps every complete line on disk.
+            session_file_helper_.flush();
+        }
+"""
+
+# ---------------------------------------------------------------------------------------------
 # 7. startup milestone counters
 #
 # The vblank loop keeps drawing blank frames at 60 Hz while the guest never submits, so the log
@@ -720,6 +773,21 @@ def main():
          [(HCA_INCLUDE_OLD, HCA_INCLUDE_NEW), (HCA_INVOKE_OLD, HCA_INVOKE_NEW)],
          marker=b"BachataDiag::NoteUnresolvedCall", note="(unimplemented HLE call counter)")
 
+    # 7b. call tail on the typed adapter, i.e. every implemented HLE call
+    edit(core / "src/core/guest_cpu/hle_call_adapter.h",
+         [(HCA_TYPED_OLD, HCA_TYPED_NEW)],
+         marker=b"BachataDiag::NoteHleCall", note="(last-N HLE call ring)")
+
+    # 7c. keep the tail of the log on disk
+    #
+    # The marker has to be the injected comment, not the flush call: flush_() at the bottom of the
+    # class already ends with "session_file_helper_.flush();", so using that as the marker makes the
+    # injection look applied on a pristine tree and it silently never lands.
+    edit(core / "src/common/logging/log_file_sink.h",
+         [(LOGSINK_OLD, LOGSINK_NEW)],
+         marker=b"Bachata: file_helper_ is a fully buffered stdio stream",
+         note="(log file flushed per message)")
+
     # 8. startup milestones
     edit(core / "src/core/libraries/pad/pad.cpp",
          [(PAD_INCLUDE_OLD, PAD_INCLUDE_NEW), (PAD_OPEN_OLD, PAD_OPEN_NEW)],
@@ -790,6 +858,10 @@ def main():
         (core / "src/core/libraries/videoout/driver.cpp", b"BachataDiag::presents"),
         (core / "src/core/libraries/gnmdriver/gnmdriver.cpp", b"BachataDiag::gnm_submits"),
         (core / "src/core/guest_cpu/hle_call_adapter.h", b"BachataDiag::NoteUnresolvedCall"),
+        (core / "src/core/guest_cpu/hle_call_adapter.h", b"BachataDiag::NoteHleCall"),
+        (core / "src/common/logging/log_file_sink.h",
+         b"Bachata: file_helper_ is a fully buffered stdio stream"),
+        (core / "src/common/bachata_diag.h", b"FormatCallTail"),
         (core / "src/core/libraries/pad/pad.cpp", b"BachataDiag::pad_opens"),
         (core / "src/core/libraries/system/systemservice.cpp", b"BachataDiag::sys_recvevent"),
         (core / "src/core/libraries/save_data/savedata.cpp", b"BachataDiag::save_mounts"),
