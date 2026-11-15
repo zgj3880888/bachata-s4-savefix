@@ -586,6 +586,334 @@ TM_LOG_NEW = b"""    // Bachata: array_mode and num_samples are part of the cach
 """
 
 # ---------------------------------------------------------------------------------------------
+# 7h. Ngs2 -- the allocator callbacks are guest function pointers
+#
+# sceNgs2SystemCreateWithAllocator / sceNgs2RackCreateWithAllocator both take a callback pair and
+# invoke them directly. On an x86-64 host that happens to be correct, because the guest *is* x86.
+# Under FEX the guest is x86 but the host is AArch64, so a direct call enters x86-64 bytes with
+# AArch64 semantics: it either faults or returns garbage. Either way the buffer comes back empty,
+# ValidateBuffer rejects it, and the caller retries -- which is exactly the six-call loop the
+# heartbeat shows (pthread_self / rwlock_* / sceSysmoduleLoadModule / SystemCreateWithAllocator)
+# with gnm=0, flip=0 for minutes on end.
+#
+# The fix routes every callback through Linker::RunGuestFunction, and when a callback still yields
+# nothing usable it degrades to host memory instead of failing. The 0.1.6 lineage (what S4+ ships)
+# never had this problem because the whole module just returned ORBIS_OK.
+# ---------------------------------------------------------------------------------------------
+NGS2_INCLUDE_OLD = b"""#include "core/libraries/ngs2/ngs2_submixer.h"
+"""
+
+NGS2_INCLUDE_NEW = b"""#include "core/libraries/ngs2/ngs2_submixer.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/guest_cpu/guest_callback.h"
+#endif
+"""
+
+NGS2_OPTION_OLD = b"""    if (option) {
+        if (option->size != sizeof(*option)) {
+            return ORBIS_NGS2_ERROR_INVALID_OPTION_SIZE;
+        }
+
+        result = *option;
+    }
+
+    if (!ValidGrain(result.maxGrainSamples)) {
+        return ORBIS_NGS2_ERROR_INVALID_MAX_GRAIN_SAMPLES;
+    }
+
+    if (!ValidGrain(result.numGrainSamples)) {
+        return ORBIS_NGS2_ERROR_INVALID_NUM_GRAIN_SAMPLES;
+    }
+
+    if (!ValidSampleRate(result.sampleRate)) {
+        return ORBIS_NGS2_ERROR_INVALID_SAMPLE_RATE;
+    }
+"""
+
+NGS2_OPTION_NEW = b"""    if (option) {
+        // Bachata: the guest decides sizeof(OrbisNgs2SystemOption) from its own SDK headers, so a
+        // mismatch here used to turn into a silent retry loop. Read min(size, ours) instead and
+        // say what arrived.
+        if (option->size == 0 || option->size > 4096) {
+            LOG_ERROR(Lib_Ngs2, "sceNgs2SystemOption size {} is unusable", option->size);
+            return ORBIS_NGS2_ERROR_INVALID_OPTION_SIZE;
+        }
+
+        if (option->size != sizeof(*option)) {
+            LOG_WARNING(Lib_Ngs2, "sceNgs2SystemOption size {} != {}; reading a prefix",
+                        option->size, sizeof(*option));
+        }
+
+        std::memcpy(&result, option, std::min(option->size, sizeof(result)));
+    }
+
+    LOG_INFO(Lib_Ngs2, "system option grain={}/{} rate={} flags={:#x}",
+             result.maxGrainSamples, result.numGrainSamples, result.sampleRate, result.flags);
+
+    // Bachata: never reject the option. A rejection is invisible to the guest except as "audio
+    // init failed", and it retries forever instead of starting the game.
+    if (!ValidGrain(result.maxGrainSamples)) {
+        LOG_WARNING(Lib_Ngs2, "maxGrainSamples {} invalid; clamping to 512",
+                    result.maxGrainSamples);
+        result.maxGrainSamples = 512;
+    }
+
+    if (result.numGrainSamples == 0) {
+        result.numGrainSamples = result.maxGrainSamples;
+    } else if (!ValidGrain(result.numGrainSamples)) {
+        LOG_WARNING(Lib_Ngs2, "numGrainSamples {} invalid; clamping to {}",
+                    result.numGrainSamples, result.maxGrainSamples);
+        result.numGrainSamples = result.maxGrainSamples;
+    }
+
+    if (!ValidSampleRate(result.sampleRate)) {
+        LOG_WARNING(Lib_Ngs2, "sampleRate {} unsupported; clamping to 48000", result.sampleRate);
+        result.sampleRate = 48000;
+    }
+"""
+
+NGS2_HELPERS_OLD = b"""void QueryBuffer(OrbisNgs2ContextBufferInfo& buffer, size_t size) {
+    buffer.hostBuffer = nullptr;
+    buffer.hostBufferSize = size;
+    std::ranges::fill(buffer.reserved, 0);
+}
+"""
+
+NGS2_HELPERS_NEW = b"""void QueryBuffer(OrbisNgs2ContextBufferInfo& buffer, size_t size) {
+    buffer.hostBuffer = nullptr;
+    buffer.hostBufferSize = size;
+    std::ranges::fill(buffer.reserved, 0);
+}
+
+// Bachata: sceNgs2 hands us guest function pointers. Calling them directly is only valid when the
+// guest is the host (x86-64); under FEX the call has to go through the bridge, and a callback that
+// yields no usable buffer has to degrade to host memory rather than fail the whole audio init.
+namespace {
+
+class HostBufferPool final {
+public:
+    void* Acquire(size_t size) {
+        std::scoped_lock lock{mutex};
+        auto block = std::make_unique<u8[]>(size);
+        void* raw = block.get();
+        blocks.push_back(std::move(block));
+        return raw;
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<std::unique_ptr<u8[]>> blocks;
+};
+
+HostBufferPool& BufferPool() {
+    static HostBufferPool pool;
+    return pool;
+}
+
+template <typename Handler>
+s32 CallBufferHandler(Handler handler, OrbisNgs2ContextBufferInfo* info, const char* label) {
+    if (handler == nullptr) {
+        return ORBIS_OK;
+    }
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    if (Core::GuestCpu::IsGuestFunctionAddress(reinterpret_cast<const void*>(handler))) {
+        const auto status = static_cast<s32>(Core::GuestCpu::RunGuestFunctionOrAbort(
+            reinterpret_cast<const void*>(handler), label, info));
+        LOG_INFO(Lib_Ngs2, "{}: guest callback -> {} buffer={} size={}", label, status,
+                 info->hostBuffer, info->hostBufferSize);
+        return status;
+    }
+#endif
+    const auto status = handler(info);
+    LOG_INFO(Lib_Ngs2, "{}: callback -> {} buffer={} size={}", label, status, info->hostBuffer,
+             info->hostBufferSize);
+    return status;
+}
+
+OrbisNgs2ContextBufferInfo EnsureUsableBuffer(OrbisNgs2ContextBufferInfo buffer, size_t required,
+                                              const char* label, bool* host_owned) {
+    *host_owned = false;
+    if (buffer.hostBuffer != nullptr && buffer.hostBufferSize >= required) {
+        return buffer;
+    }
+
+    LOG_WARNING(Lib_Ngs2,
+                "{}: allocator gave no usable buffer (buffer={} size={} required={}); using host "
+                "memory",
+                label, buffer.hostBuffer, buffer.hostBufferSize, required);
+    buffer.hostBuffer = BufferPool().Acquire(required);
+    buffer.hostBufferSize = required;
+    *host_owned = true;
+    return buffer;
+}
+
+} // namespace
+"""
+
+NGS2_RELEASE_OLD = b"""    void Release(OrbisNgs2ContextBufferInfo* outInfo = nullptr) {
+        if (freeHandler) {
+            freeHandler(&buffer);
+        }
+"""
+
+NGS2_RELEASE_NEW = b"""    void Release(OrbisNgs2ContextBufferInfo* outInfo = nullptr) {
+        if (freeHandler) {
+            // Bachata: same guest-pointer rule as the allocator.
+            CallBufferHandler(freeHandler, &buffer, "buffer release");
+        }
+"""
+
+NGS2_SYSCREATE_OLD = b"""s32 SystemCreateWithAllocator(const OrbisNgs2SystemOption* option,
+                              const OrbisNgs2BufferAllocator* allocator,
+                              OrbisNgs2Handle* outHandle) {
+    if (!allocator || !allocator->allocHandler) {
+        return ORBIS_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR;
+    }
+
+    if (!outHandle) {
+        return ORBIS_NGS2_ERROR_INVALID_OUT_ADDRESS;
+    }
+
+    const auto callbacks = *allocator;
+    OrbisNgs2SystemOption normalized;
+    auto result = ReadSystemOption(option, normalized);
+    if (result < 0) {
+        return result;
+    }
+
+    OrbisNgs2ContextBufferInfo buffer{};
+    QueryBuffer(buffer, SystemBufferSize(normalized));
+    buffer.userData = callbacks.userData;
+    result = callbacks.allocHandler(&buffer);
+    if (result < 0) {
+        return result;
+    }
+
+    result = ReadSystemOption(option, normalized);
+    if (result >= 0) {
+        result = CreateSystem(normalized, buffer, callbacks.freeHandler, outHandle);
+    }
+
+    if (result < 0 && callbacks.freeHandler) {
+        callbacks.freeHandler(&buffer);
+    }
+
+    return result;
+}
+
+s32 SystemDestroy("""
+
+NGS2_SYSCREATE_NEW = b"""s32 SystemCreateWithAllocator(const OrbisNgs2SystemOption* option,
+                              const OrbisNgs2BufferAllocator* allocator,
+                              OrbisNgs2Handle* outHandle) {
+    if (!allocator || !allocator->allocHandler) {
+        LOG_ERROR(Lib_Ngs2, "SystemCreateWithAllocator: no allocator");
+        return ORBIS_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR;
+    }
+
+    if (!outHandle) {
+        LOG_ERROR(Lib_Ngs2, "SystemCreateWithAllocator: no outHandle");
+        return ORBIS_NGS2_ERROR_INVALID_OUT_ADDRESS;
+    }
+
+    const auto callbacks = *allocator;
+    OrbisNgs2SystemOption normalized;
+    auto result = ReadSystemOption(option, normalized);
+    if (result < 0) {
+        LOG_ERROR(Lib_Ngs2, "SystemCreateWithAllocator: option rejected {}", result);
+        return result;
+    }
+
+    OrbisNgs2ContextBufferInfo buffer{};
+    QueryBuffer(buffer, SystemBufferSize(normalized));
+    buffer.userData = callbacks.userData;
+    result = CallBufferHandler(callbacks.allocHandler, &buffer, "SystemCreateWithAllocator");
+    if (result < 0) {
+        LOG_ERROR(Lib_Ngs2, "SystemCreateWithAllocator: allocator returned {}", result);
+        return result;
+    }
+
+    bool host_owned = false;
+    buffer = EnsureUsableBuffer(buffer, SystemBufferSize(normalized), "SystemCreateWithAllocator",
+                               &host_owned);
+
+    result = ReadSystemOption(option, normalized);
+    if (result >= 0) {
+        result = CreateSystem(normalized, buffer, host_owned ? nullptr : callbacks.freeHandler,
+                              outHandle);
+    }
+
+    LOG_INFO(Lib_Ngs2, "SystemCreateWithAllocator -> {} handle={} host_buffer={}", result,
+             outHandle != nullptr ? *outHandle : 0, host_owned);
+
+    if (result < 0 && !host_owned && callbacks.freeHandler) {
+        CallBufferHandler(callbacks.freeHandler, &buffer, "SystemCreateWithAllocator free");
+    }
+
+    return result;
+}
+
+s32 SystemDestroy("""
+
+NGS2_RACKCREATE_OLD = b"""    const auto callbacks = *allocator;
+    OrbisNgs2ContextBufferInfo buffer{};
+    QueryBuffer(buffer, RackBufferSize(config));
+    buffer.userData = callbacks.userData;
+    result = callbacks.allocHandler(&buffer);
+    if (result < 0) {
+        return result;
+    }
+
+    result = ReadRackOption(rackId, option, config);
+    if (result >= 0) {
+        auto system = LockedHandle{systemHandle, HandleType::System};
+        result = system ? CreateRack(system.entry.system, config, buffer, callbacks.freeHandler,
+                                     outHandle)
+                        : ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+    }
+
+    if (result < 0 && callbacks.freeHandler) {
+        callbacks.freeHandler(&buffer);
+    }
+
+    return result;
+}
+"""
+
+NGS2_RACKCREATE_NEW = b"""    const auto callbacks = *allocator;
+    OrbisNgs2ContextBufferInfo buffer{};
+    QueryBuffer(buffer, RackBufferSize(config));
+    buffer.userData = callbacks.userData;
+    result = CallBufferHandler(callbacks.allocHandler, &buffer, "RackCreateWithAllocator");
+    if (result < 0) {
+        LOG_ERROR(Lib_Ngs2, "RackCreateWithAllocator: allocator returned {}", result);
+        return result;
+    }
+
+    const auto required = RackBufferSize(config);
+    bool host_owned = false;
+    buffer = EnsureUsableBuffer(buffer, required, "RackCreateWithAllocator", &host_owned);
+
+    result = ReadRackOption(rackId, option, config);
+    if (result >= 0) {
+        auto system = LockedHandle{systemHandle, HandleType::System};
+        result = system ? CreateRack(system.entry.system, config, buffer,
+                                     host_owned ? nullptr : callbacks.freeHandler, outHandle)
+                        : ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+    }
+
+    LOG_INFO(Lib_Ngs2, "RackCreateWithAllocator id={:#x} -> {} handle={} host_buffer={}", rackId,
+             result, outHandle != nullptr ? *outHandle : 0, host_owned);
+
+    if (result < 0 && !host_owned && callbacks.freeHandler) {
+        CallBufferHandler(callbacks.freeHandler, &buffer, "RackCreateWithAllocator free");
+    }
+
+    return result;
+}
+"""
+
+# ---------------------------------------------------------------------------------------------
 # 7. startup milestone counters
 #
 # The vblank loop keeps drawing blank frames at 60 Hz while the guest never submits, so the log
@@ -1094,6 +1422,15 @@ def main():
          [(AUDIO_INCLUDE_OLD, AUDIO_INCLUDE_NEW), (AUDIO_OPEN_OLD, AUDIO_OPEN_NEW)],
          marker=b"BachataDiag::audio_opens", note="(audio open counter)")
 
+    # 7h. Ngs2 allocator callbacks: guest pointers must cross the FEX bridge
+    edit(core / "src/core/libraries/ngs2/ngs2_impl.cpp",
+         [(NGS2_INCLUDE_OLD, NGS2_INCLUDE_NEW), (NGS2_OPTION_OLD, NGS2_OPTION_NEW),
+          (NGS2_HELPERS_OLD, NGS2_HELPERS_NEW), (NGS2_RELEASE_OLD, NGS2_RELEASE_NEW),
+          (NGS2_SYSCREATE_OLD, NGS2_SYSCREATE_NEW),
+          (NGS2_RACKCREATE_OLD, NGS2_RACKCREATE_NEW)],
+         marker=b"Bachata: sceNgs2 hands us guest function pointers",
+         note="(Ngs2 allocator callbacks via FEX bridge + host buffer fallback)")
+
     # 9. libc_internal -- the real fix. MUST run last: it changes what the guest links against.
     # This file is handled by brace-matched splicing, not a byte anchor -- see the note next to
     # FEX_BLOCK. Two shapes exist and the obvious idempotency marker is ambiguous.
@@ -1162,6 +1499,9 @@ def main():
         (core / "src/core/libraries/system/systemservice.cpp", b"BachataDiag::sys_recvevent"),
         (core / "src/core/libraries/save_data/savedata.cpp", b"BachataDiag::save_mounts"),
         (core / "src/core/libraries/audio/audioout.cpp", b"BachataDiag::audio_opens"),
+        (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"CallBufferHandler"),
+        (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"using host memory"),
+        (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"SystemCreateWithAllocator -> {}"),
         # 9. libc aliases. Accepted in either shape: the canonical rewritten comment (r19/r20
         # trees) or the upstream block that ups-full already carries. Both register the same
         # four alias families, so only that is asserted, not the comment text.
