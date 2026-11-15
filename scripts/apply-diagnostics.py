@@ -829,8 +829,10 @@ NGS2_SYSCREATE_NEW = b"""s32 SystemCreateWithAllocator(const OrbisNgs2SystemOpti
     buffer.userData = callbacks.userData;
     result = CallBufferHandler(callbacks.allocHandler, &buffer, "SystemCreateWithAllocator");
     if (result < 0) {
-        LOG_ERROR(Lib_Ngs2, "SystemCreateWithAllocator: allocator returned {}", result);
-        return result;
+        LOG_WARNING(Lib_Ngs2, "SystemCreateWithAllocator: allocator returned {}", result);
+        // Bachata: an allocator error is the guest's answer, not the game's death sentence. Fall
+        // through to the host buffer instead of handing the error back -- a failure here is
+        // invisible to the guest except as "audio init never completes", and it retries forever.
     }
 
     bool host_owned = false;
@@ -886,8 +888,8 @@ NGS2_RACKCREATE_NEW = b"""    const auto callbacks = *allocator;
     buffer.userData = callbacks.userData;
     result = CallBufferHandler(callbacks.allocHandler, &buffer, "RackCreateWithAllocator");
     if (result < 0) {
-        LOG_ERROR(Lib_Ngs2, "RackCreateWithAllocator: allocator returned {}", result);
-        return result;
+        LOG_WARNING(Lib_Ngs2, "RackCreateWithAllocator: allocator returned {}", result);
+        // Same policy as SystemCreateWithAllocator: degrade to host memory, never fail the call.
     }
 
     const auto required = RackBufferSize(config);
