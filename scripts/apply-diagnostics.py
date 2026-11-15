@@ -444,6 +444,148 @@ LOGSINK_NEW = b"""        if (session_file_helper_.filename().empty()) {
 """
 
 # ---------------------------------------------------------------------------------------------
+# 7f. make the log survive the run
+#
+# Per-message flush is useless if the message never reaches the sink. The default chain is
+#     logger -> dup_filter_sink_mt -> async_sink -> [console, file]
+# and async_sink hands records to a background thread through a queue. A guest that dies on a
+# signal never drains that queue, so the queued part -- the tail worth reading -- is gone. Switch()
+# then reopened the session file with truncation on every attempt, and the app retries the core
+# several times per launch (the r23 log shows arm64-025 twice followed by the dispatcher four
+# times), so each attempt erased the one before it. That is why six rounds of diagnosis only ever
+# saw the first 4 KB of a run and why every conclusion drawn past that point was guesswork.
+# Log synchronously, flush on every record, and never truncate.
+# ---------------------------------------------------------------------------------------------
+LOG_SINKS_OLD = b"""    std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
+        spdlog::sinks::async_sink::config{.sinks = sinks})};
+
+    std::initializer_list<spdlog::sink_ptr> dup_filter{
+        std::make_shared<spdlog::sinks::dup_filter_sink_mt>(
+            std::chrono::milliseconds(EmulatorSettings.GetLogMaxSkipDuration()),
+            EmulatorSettings.IsLogSync() ? sinks : async_sink)};
+
+    for (auto& logger : ALL_LOGGERS) {
+        logger->sinks() = EmulatorSettings.IsLogSkipDuplicate()
+                              ? dup_filter
+                              : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+    }
+"""
+
+LOG_SINKS_NEW = b"""    // Bachata: always synchronous. async_sink is cheaper per record, but it is a queue drained by
+    // a background thread and a crashing guest never lets it drain.
+    for (auto& logger : ALL_LOGGERS) {
+        logger->sinks() = sinks;
+        logger->flush_on(spdlog::level::trace);
+    }
+"""
+
+LOG_FLUSH_OLD = b"""void UpdateLogFlushLevel(std::string_view log_flush_level) {
+    if (!log_flush_level.empty()) {
+        for (auto& logger : ALL_LOGGERS) {
+            logger->flush_on(spdlog::level_from_str(log_flush_level.data()));
+        }
+    }
+}
+"""
+
+LOG_FLUSH_NEW = b"""void UpdateLogFlushLevel(std::string_view log_flush_level) {
+    // Bachata: ignore the configured level. Switch() calls UpdateSinks() and then this, so
+    // anything weaker than trace would immediately undo the per-record flush set above.
+    static_cast<void>(log_flush_level);
+    for (auto& logger : ALL_LOGGERS) {
+        logger->flush_on(spdlog::level::trace);
+    }
+}
+"""
+
+LOG_SWITCH_OLD = b"""    g_shad_file_sink->session_file_helper_.open(
+        (GetUserPath(Common::FS::PathType::LogDir) / game_filename).string(),
+        !(append_log || EmulatorSettings.IsLogAppend()));
+"""
+
+LOG_SWITCH_NEW = b"""    // Bachata: never truncate. The app retries the core several times per launch and every
+    // attempt used to erase the previous one, which is how six runs produced a single 4 KB log.
+    static_cast<void>(append_log);
+    g_shad_file_sink->session_file_helper_.open(
+        (GetUserPath(Common::FS::PathType::LogDir) / game_filename).string(), false);
+    LOG_INFO(Config, "=== Bachata: session start (append, sync) ===");
+"""
+
+# ---------------------------------------------------------------------------------------------
+# 7g. tiling pipeline cache key
+#
+# Upstream 0.21 keys the tiling pipeline cache on tile_mode + num_bits + num_samples + is_tiler,
+# but array_mode is what actually picks the shader. AmdGpu::IsMacroTiled(array_mode) selects
+# between the macro and micro modules outright, and AmdGpu::GetMicroTileThickness(array_mode)
+# feeds MICRO_TILE_THICKNESS (1, 4 or 8). So two images agreeing on tile_mode/bits/samples but
+# disagreeing on array_mode collided in the cache and the first one created decided how the other
+# was detiled: a micro image run through the macro module, or a thick image detiled as thin. That
+# is a shifted / blocky / black texture, not a crash, which matches the symptom instead of the
+# startup wall we have been chasing.
+#
+# The port tree's own key (tile_mode * NUM_BPPS + bpp index) is coarser still, so this is not a
+# regression to restore -- it is a hole both trees have and 0.21 narrows without closing.
+# ---------------------------------------------------------------------------------------------
+TM_KEY_OLD = b"""    struct TilingKey {
+        AmdGpu::TileMode tile_mode;
+        u32 num_bits;
+        u32 num_samples;
+        bool is_tiler;
+
+        bool operator==(const TilingKey&) const = default;
+
+        struct Hash {
+            size_t operator()(const TilingKey& key) const {
+                size_t hash = 0;
+                boost::hash_combine(hash, key.tile_mode);
+                boost::hash_combine(hash, key.num_bits);
+"""
+
+TM_KEY_NEW = b"""    struct TilingKey {
+        AmdGpu::TileMode tile_mode;
+        // Bachata: array_mode decides which module gets bound, not just a constant inside it.
+        AmdGpu::ArrayMode array_mode;
+        u32 num_bits;
+        u32 num_samples;
+        bool is_tiler;
+
+        bool operator==(const TilingKey&) const = default;
+
+        struct Hash {
+            size_t operator()(const TilingKey& key) const {
+                size_t hash = 0;
+                boost::hash_combine(hash, key.tile_mode);
+                boost::hash_combine(hash, key.array_mode);
+                boost::hash_combine(hash, key.num_bits);
+"""
+
+TM_CPP_OLD = b"""    const TilingKey key{
+        .tile_mode = info.tile_mode,
+        .num_bits = info.num_bits,
+        .num_samples = info.num_samples,
+        .is_tiler = is_tiler,
+    };
+"""
+
+TM_CPP_NEW = b"""    const TilingKey key{
+        .tile_mode = info.tile_mode,
+        .array_mode = info.array_mode,
+        .num_bits = info.num_bits,
+        .num_samples = info.num_samples,
+        .is_tiler = is_tiler,
+    };
+"""
+
+TM_LOG_OLD = b"""    LOG_INFO(Render_Vulkan, "Creating tiling pipeline {}", module_name);
+"""
+
+TM_LOG_NEW = b"""    // Bachata: array_mode and num_samples are part of the cache key now, so print them next to
+    // the module name -- a log line is the only place that shows which variant an image got.
+    LOG_INFO(Render_Vulkan, "Creating tiling pipeline {} array_mode={} samples={} macro={}",
+             module_name, u32(info.array_mode), info.num_samples, is_macro);
+"""
+
+# ---------------------------------------------------------------------------------------------
 # 7. startup milestone counters
 #
 # The vblank loop keeps drawing blank frames at 60 Hz while the guest never submits, so the log
@@ -917,6 +1059,22 @@ def main():
          [(SIG_INCLUDE_OLD, SIG_INCLUDE_NEW), (SIG_TAIL_OLD, SIG_TAIL_NEW)],
          marker=b"Bachata: drain the last-N HLE call ring", note="(HLE call tail at fault)")
 
+    # 7f. sync logging, per-record flush, append-only session file
+    edit(core / "src/common/logging/log.cpp",
+         [(LOG_SINKS_OLD, LOG_SINKS_NEW), (LOG_FLUSH_OLD, LOG_FLUSH_NEW),
+          (LOG_SWITCH_OLD, LOG_SWITCH_NEW)],
+         marker=b"Bachata: always synchronous", note="(sync sinks, flush trace, append)")
+
+    # 7g. tiling pipeline cache key includes array_mode
+    edit(core / "src/video_core/texture_cache/tile_manager.h",
+         [(TM_KEY_OLD, TM_KEY_NEW)],
+         marker=b"Bachata: array_mode decides which module gets bound",
+         note="(tiling key + array_mode)")
+
+    edit(core / "src/video_core/texture_cache/tile_manager.cpp",
+         [(TM_CPP_OLD, TM_CPP_NEW), (TM_LOG_OLD, TM_LOG_NEW)],
+         marker=b".array_mode = info.array_mode,", note="(tiling key + array_mode)")
+
     # 8. startup milestones
     edit(core / "src/core/libraries/pad/pad.cpp",
          [(PAD_INCLUDE_OLD, PAD_INCLUDE_NEW), (PAD_OPEN_OLD, PAD_OPEN_NEW)],
@@ -993,6 +1151,12 @@ def main():
         (core / "src/core/signals.cpp", b"HLE call tail at fault"),
         (core / "src/common/logging/log_file_sink.h",
          b"Bachata: file_helper_ is a fully buffered stdio stream"),
+        (core / "src/common/logging/log.cpp", b"Bachata: always synchronous"),
+        (core / "src/common/logging/log.cpp", b"Bachata: session start (append, sync)"),
+        (core / "src/video_core/texture_cache/tile_manager.cpp", b".array_mode = info.array_mode,"),
+        (core / "src/video_core/texture_cache/tile_manager.cpp", b"array_mode={} samples={}"),
+        (core / "src/video_core/texture_cache/tile_manager.h",
+         b"Bachata: array_mode decides which module gets bound"),
         (core / "src/common/bachata_diag.h", b"FormatCallTail"),
         (core / "src/core/libraries/pad/pad.cpp", b"BachataDiag::pad_opens"),
         (core / "src/core/libraries/system/systemservice.cpp", b"BachataDiag::sys_recvevent"),

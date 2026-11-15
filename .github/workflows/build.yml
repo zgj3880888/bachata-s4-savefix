@@ -424,9 +424,15 @@ jobs:
           # 'HLE call tail at fault' is the fatal-path dump: this title dies 1.8 s in, before
           # the first five-second heartbeat, so that line is the only way a crash report ever
           # carries the guest's last HLE calls.
+          # 'Bachata: session start (append, sync)' proves the log no longer truncates: the app
+          # retries the core several times per launch and every attempt used to erase the one
+          # before it, so a run that reaches the interesting part still handed us a 4 KB file.
+          # 'array_mode={} samples={}' proves the tiling cache key carries array_mode, which is
+          # what picks between the macro and micro modules and sets MICRO_TILE_THICKNESS.
           for s in 'bachata-heartbeat.txt' 'libSceNgs2.sprx is pre-registered at startup' \
                    '[bachata-diag] heartbeat armed' 'gmain=' 'busy=' 'gsys=' 'enosys=' \
-                   'ev=p%llu' 'tail=' 'HLE call tail at fault'; do
+                   'ev=p%llu' 'tail=' 'HLE call tail at fault' \
+                   'Bachata: session start (append, sync)' 'array_mode={} samples={}'; do
             if grep -qaF -- "$s" "$bin"; then echo "OK   diag $s"; else
               echo "MISS diag $s"; fail=1; fi
           done
