@@ -1470,6 +1470,7 @@ def main():
 
     # Cheap sanity pass: the strings the CI verifier greps for in the binary.
     print("--- diagnostics check ---")
+    misses = []
     for path, needle in (
         (core / "src/common/bachata_diag.h", b"bachata-heartbeat.txt"),
         (core / "src/common/bachata_diag.h", b"ev=p%llu"),
@@ -1500,7 +1501,13 @@ def main():
         (core / "src/core/libraries/save_data/savedata.cpp", b"BachataDiag::save_mounts"),
         (core / "src/core/libraries/audio/audioout.cpp", b"BachataDiag::audio_opens"),
         (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"CallBufferHandler"),
-        (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"using host memory"),
+        # The guest-pointer path and the host fallback, asserted on code that stays on one source
+        # line. Do NOT assert on a user facing message here: the fallback warning is written as
+        # "using host "\n "memory" across two C++ string literals, so the prose never appears
+        # contiguously in the file and the assertion fails on a perfectly good tree (r26 stopped
+        # the build on exactly that).
+        (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"RunGuestFunctionOrAbort"),
+        (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"BufferPool().Acquire(required)"),
         (core / "src/core/libraries/ngs2/ngs2_impl.cpp", b"SystemCreateWithAllocator -> {}"),
         # 9. libc aliases. Accepted in either shape: the canonical rewritten comment (r19/r20
         # trees) or the upstream block that ups-full already carries. Both register the same
@@ -1526,7 +1533,9 @@ def main():
         ok = needle in path.read_bytes()
         print(f"  {'OK  ' if ok else 'MISS'} {path.relative_to(core)} :: {needle.decode()}")
         if not ok:
-            sys.exit(1)
+            # Report every failure in one pass: aborting on the first one turned a single bad
+            # needle into a full 20 minute rebuild before anyone could see the rest.
+            misses.append(f"{path.relative_to(core)} :: {needle.decode()}")
 
     # Structural check the grep above cannot make: RegisterFexLibcHostAliases has to be in
     # RegisterLib(), which is the one the linker actually calls. Landing it in ForceRegisterLib()
@@ -1539,7 +1548,7 @@ def main():
     print(f"  {'OK  ' if placed else 'MISS'} libc_internal.cpp :: host aliases inside "
           f"RegisterLib (not ForceRegisterLib)")
     if not placed:
-        sys.exit(1)
+        misses.append("libc_internal.cpp :: host aliases not inside RegisterLib")
 
     # Second structural check: no LIB_FUNCTION() may take a C-variadic function.
     #
@@ -1562,6 +1571,12 @@ def main():
           f"{len(registered)} registrations, none C-variadic"
           + (f" (offenders: {', '.join(variadic)})" if variadic else ""))
     if variadic:
+        misses.append("libc_internal_host.cpp :: C-variadic registration")
+
+    if misses:
+        print(f"--- {len(misses)} assertion(s) failed ---")
+        for m in misses:
+            print(f"      {m}")
         sys.exit(1)
 
 
